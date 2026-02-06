@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-telegram-tasks-notifier",
+  "name": "Telegram Tasks Notifier",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Sends unfinished Tasks plugin tasks to Telegram and marks them complete from Telegram.",
+  "author": "OpenCode",
+  "authorUrl": "https://example.com",
+  "isDesktopOnly": false
+}
