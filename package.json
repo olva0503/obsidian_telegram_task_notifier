@@ -1,7 +1,7 @@
 {
   "name": "obsidian-telegram-tasks-notifier",
   "version": "0.1.0",
-  "main": "main.js",
+  "main": "dist/main.js",
   "scripts": {
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs development",
