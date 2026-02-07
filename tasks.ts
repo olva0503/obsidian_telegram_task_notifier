@@ -31,6 +31,12 @@ export type TaskLike = {
   line?: number;
   lineNumber?: number;
   position?: { start?: { line?: number } };
+  id?: unknown;
+  uuid?: unknown;
+  uid?: unknown;
+  taskId?: unknown;
+  blockId?: unknown;
+  $id?: unknown;
   priority?: unknown;
   priorityNumber?: unknown;
   priorityValue?: unknown;
@@ -223,6 +229,35 @@ export const getTaskLine = (task: TaskLike): number | null => {
   return Number.isFinite(line) ? Number(line) : null;
 };
 
+const normalizeExternalId = (value: unknown): string | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "object") {
+    const record = value as { id?: unknown; value?: unknown };
+    return normalizeExternalId(record.id ?? record.value);
+  }
+  return null;
+};
+
+const getTaskExternalId = (task: TaskLike): string | null => {
+  const candidates = [task.id, task.uuid, task.uid, task.taskId, task.blockId, task.$id];
+  for (const candidate of candidates) {
+    const normalized = normalizeExternalId(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+};
+
 const normalizePriority = (value: unknown): number | null => {
   if (value === null || value === undefined) {
     return null;
@@ -413,7 +448,12 @@ export const toTaskRecord = (task: TaskLike): TaskRecord => {
   const priority = getTaskPriority(task);
   const dueTimestamp = getTaskDueTimestamp(task);
   const storedId = getStoredTaskId(raw ?? text);
-  const id = storedId ?? hashTaskId(`${path ?? ""}::${line ?? ""}::${raw ?? text}`);
+  const externalId = getTaskExternalId(task);
+  const identityPieces = [path ?? "", line ?? "", raw ?? text];
+  if (externalId) {
+    identityPieces.push(`external:${externalId}`);
+  }
+  const id = storedId ?? hashTaskId(identityPieces.join("::"));
   const shortId = id.slice(0, 8);
   return { id, shortId, text, path, line, raw, priority, dueTimestamp };
 };

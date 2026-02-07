@@ -5,16 +5,21 @@ export const buildTaskIdTagRegex = (flags: "i" | "gi" = "i"): RegExp => {
   return new RegExp(`(^|\\s)${escapedPrefix}[0-9a-f]+(?=\\s|$|[.,;:!?])`, flags);
 };
 
+export const buildTaskIdTagRegexForId = (id: string, flags: "i" | "gi" = "i"): RegExp => {
+  const escapedPrefix = TASK_ID_TAG_PREFIX.replace("/", "\\/");
+  const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|\\s)${escapedPrefix}${escapedId}(?=\\s|$|[.,;:!?])`, flags);
+};
+
 export const getStoredTaskId = (text: string | null): string | null => {
   if (!text) {
     return null;
   }
-  const match = text.match(buildTaskIdTagRegex("i"));
-  if (!match) {
-    return null;
-  }
-  const idMatch = match[0].match(/[0-9a-f]+/i);
-  return idMatch ? idMatch[0].toLowerCase() : null;
+  const escapedPrefix = TASK_ID_TAG_PREFIX.replace("/", "\\/");
+  const match = text.match(
+    new RegExp(`(?:^|\\s)${escapedPrefix}([0-9a-f]+)(?=\\s|$|[.,;:!?])`, "i")
+  );
+  return match ? match[1].toLowerCase() : null;
 };
 
 export const stripTaskIdTag = (text: string): string => {

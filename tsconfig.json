@@ -11,7 +11,11 @@
     "moduleResolution": "node",
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "types": ["vitest/globals"],
+    "paths": {
+      "obsidian": ["tests/obsidian.ts"]
+    }
   },
-  "include": ["*.ts"]
+  "include": ["*.ts", "tests/**/*.ts", "tests/**/*.d.ts", "vitest.config.ts"]
 }

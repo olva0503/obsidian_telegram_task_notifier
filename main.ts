@@ -12,6 +12,7 @@ import {
   formatTaskTextForMessage,
   getUncheckedTaskText,
   hasTaskIdTag,
+  isTaskLine,
   isTaskCompleted,
   isTaskLike,
   matchesTaskLine,
@@ -32,7 +33,7 @@ import {
   type TelegramTasksNotifierSettings
 } from "./settings";
 import { TelegramClient, type TelegramUpdate } from "./telegram";
-import { getStoredTaskId, hashTaskId } from "./task-id";
+import { buildTaskIdTagRegexForId, getStoredTaskId, hashTaskId } from "./task-id";
 
 type TasksApi = {
   getTasks?: (query: string) => Promise<unknown[]> | unknown[];
@@ -726,6 +727,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     const contents = await this.app.vault.read(file);
     const lines = contents.split("\n");
     const shouldTag = this.settings.taskIdTaggingMode !== "never";
+    const idTagRegex = buildTaskIdTagRegexForId(task.id, "i");
 
     const candidateIndexes: number[] = [];
     if (typeof task.line === "number") {
@@ -751,6 +753,17 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
 
     for (let i = 0; i < lines.length; i += 1) {
+      if (idTagRegex.test(lines[i]) && isTaskLine(lines[i])) {
+        const updated = replaceCheckbox(lines[i]);
+        if (updated) {
+          const nextLine = shouldTag && !hasTaskIdTag(updated)
+            ? ensureTaskIdTagOnLine(updated, task.id)
+            : updated;
+          lines[i] = nextLine;
+          await this.app.vault.modify(file, lines.join("\n"));
+          return true;
+        }
+      }
       if (!matchesTaskLine(lines[i], task, false)) {
         continue;
       }

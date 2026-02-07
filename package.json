@@ -4,12 +4,15 @@
   "main": "main.js",
   "scripts": {
     "build": "node esbuild.config.mjs production",
-    "dev": "node esbuild.config.mjs development"
+    "dev": "node esbuild.config.mjs development",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "esbuild": "^0.20.2",
     "obsidian": "^1.5.8",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "happy-dom": "^14.12.3",
+    "vitest": "^1.6.0"
   }
 }
