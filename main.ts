@@ -124,6 +124,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   private notificationIntervalId: number | null = null;
   private pollingIntervalId: number | null = null;
   private taskCache = new Map<string, TaskRecord>();
+  private readonly taskIdTagPrefix = "#taskid/";
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -266,6 +267,45 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return new RegExp(`(^|\\s)${escaped}(?=\\s|$|[.,;:!?])`, "i");
   }
 
+  private formatTaskTextForMessage(text: string): string {
+    const cleanedTaskId = this.stripTaskIdTag(text);
+    const matcher = this.buildTagMatchRegex(this.settings.globalFilterTag);
+    if (!matcher) {
+      return cleanedTaskId;
+    }
+    const cleaned = cleanedTaskId.replace(matcher, " ").replace(/\s{2,}/g, " ").trim();
+    return cleaned || cleanedTaskId;
+  }
+
+  private buildTaskIdTagRegex(flags: "i" | "gi" = "i"): RegExp {
+    return new RegExp(`(^|\\s)${this.taskIdTagPrefix.replace("/", "\\/")}[0-9a-f]+(?=\\s|$|[.,;:!?])`, flags);
+  }
+
+  private getStoredTaskId(text: string | null): string | null {
+    if (!text) {
+      return null;
+    }
+    const match = text.match(this.buildTaskIdTagRegex("i"));
+    if (!match) {
+      return null;
+    }
+    const idMatch = match[0].match(/[0-9a-f]+/i);
+    return idMatch ? idMatch[0].toLowerCase() : null;
+  }
+
+  private stripTaskIdTag(text: string): string {
+    const cleaned = text.replace(this.buildTaskIdTagRegex("gi"), " ").replace(/\s{2,}/g, " ").trim();
+    return cleaned || text;
+  }
+
+  private ensureTaskIdTag(lineText: string, id: string): string {
+    if (this.buildTaskIdTagRegex("i").test(lineText)) {
+      return lineText;
+    }
+    const suffix = lineText.endsWith(" ") ? "" : " ";
+    return `${lineText}${suffix}${this.taskIdTagPrefix}${id.toLowerCase()}`;
+  }
+
   private taskMatchesGlobalTag(task: Record<string, unknown>, record: TaskRecord): boolean {
     const tag = this.normalizeTagFilter(this.settings.globalFilterTag);
     if (!tag) {
@@ -298,7 +338,6 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     const query = this.normalizeTasksQuery(this.settings.tasksQuery);
     const queryFn = api.getTasks ?? api.getTasksFromQuery ?? api.queryTasks;
     if (!queryFn) {
-      new Notice("Tasks plugin API does not expose a query method.");
       return null;
     }
     const normalize = (result: unknown): unknown[] => {
@@ -585,9 +624,95 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     const raw = this.getTaskRaw(task);
     const priority = this.getTaskPriority(task);
     const dueTimestamp = this.getTaskDueTimestamp(task);
-    const id = this.hashTaskId(`${path ?? ""}::${line ?? ""}::${raw ?? text}`);
+    const storedId = this.getStoredTaskId(raw ?? text);
+    const id = storedId ?? this.hashTaskId(`${path ?? ""}::${line ?? ""}::${raw ?? text}`);
     const shortId = id.slice(0, 8);
     return { id, shortId, text, path, line, raw, priority, dueTimestamp };
+  }
+
+  private async persistTaskIdTags(records: TaskRecord[]): Promise<void> {
+    const recordsByPath = new Map<string, TaskRecord[]>();
+    for (const record of records) {
+      if (!record.path) {
+        continue;
+      }
+      const existing = recordsByPath.get(record.path) ?? [];
+      existing.push(record);
+      recordsByPath.set(record.path, existing);
+    }
+
+    const taskRegex = /^\s*-\s*\[ \]\s*/;
+
+    for (const [path, fileRecords] of recordsByPath) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) {
+        continue;
+      }
+      const contents = await this.app.vault.read(file);
+      const lines = contents.split("\n");
+      let changed = false;
+
+      const matchesTaskLine = (lineText: string, record: TaskRecord): boolean => {
+        if (!taskRegex.test(lineText)) {
+          return false;
+        }
+        if (record.raw && lineText.includes(record.raw)) {
+          return true;
+        }
+        if (record.text && lineText.includes(record.text)) {
+          return true;
+        }
+        return false;
+      };
+
+      for (const record of fileRecords) {
+        if (!record.id) {
+          continue;
+        }
+        const candidateIndexes: number[] = [];
+        if (typeof record.line === "number") {
+          candidateIndexes.push(record.line, record.line - 1);
+        }
+
+        let updated = false;
+        for (const index of candidateIndexes) {
+          if (index < 0 || index >= lines.length) {
+            continue;
+          }
+          if (!matchesTaskLine(lines[index], record)) {
+            continue;
+          }
+          if (this.buildTaskIdTagRegex("i").test(lines[index])) {
+            updated = true;
+            break;
+          }
+          lines[index] = this.ensureTaskIdTag(lines[index], record.id);
+          changed = true;
+          updated = true;
+          break;
+        }
+
+        if (updated) {
+          continue;
+        }
+
+        for (let i = 0; i < lines.length; i += 1) {
+          if (!matchesTaskLine(lines[i], record)) {
+            continue;
+          }
+          if (this.buildTaskIdTagRegex("i").test(lines[i])) {
+            break;
+          }
+          lines[i] = this.ensureTaskIdTag(lines[i], record.id);
+          changed = true;
+          break;
+        }
+      }
+
+      if (changed) {
+        await this.app.vault.modify(file, lines.join("\n"));
+      }
+    }
   }
 
   private sortTasks(records: TaskRecord[]): TaskRecord[] {
@@ -635,6 +760,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       })
       .filter(({ task, record }) => this.taskMatchesGlobalTag(task, record))
       .map(({ record }) => record);
+    await this.persistTaskIdTags(records);
     return this.sortTasks(records);
   }
 
@@ -647,6 +773,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     for (const file of files) {
       const contents = await this.app.vault.read(file);
       const lines = contents.split("\n");
+      let changed = false;
       for (let i = 0; i < lines.length; i += 1) {
         const lineText = lines[i];
         const match = lineText.match(taskRegex);
@@ -657,10 +784,15 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           continue;
         }
         const text = match[1]?.trim() || "(unnamed task)";
-        const id = this.hashTaskId(`${file.path}::${i}::${lineText}`);
+        const storedId = this.getStoredTaskId(lineText);
+        const id = storedId ?? this.hashTaskId(`${file.path}::${i}::${lineText}`);
         const shortId = id.slice(0, 8);
         const priority = this.parsePriorityFromRaw(lineText) ?? 0;
         const dueTimestamp = this.parseDueFromRaw(lineText);
+        if (!storedId) {
+          lines[i] = this.ensureTaskIdTag(lineText, id);
+          changed = true;
+        }
         records.push({
           id,
           shortId,
@@ -671,6 +803,9 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           priority,
           dueTimestamp
         });
+      }
+      if (changed) {
+        await this.app.vault.modify(file, lines.join("\n"));
       }
     }
 
@@ -717,7 +852,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       const location = this.settings.includeFilePath && task.path
         ? ` (${task.path}${task.line !== null ? ":" + task.line : ""})`
         : "";
-      return `- ${task.text}${location} #${task.shortId}`;
+      return `- ${this.formatTaskTextForMessage(task.text)}${location} #${task.shortId}`;
     });
     const footer = tasks.length > shownTasks.length
       ? `...and ${tasks.length - shownTasks.length} more`

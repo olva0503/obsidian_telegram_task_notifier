@@ -90,6 +90,7 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
     this.notificationIntervalId = null;
     this.pollingIntervalId = null;
     this.taskCache = /* @__PURE__ */ new Map();
+    this.taskIdTagPrefix = "#taskid/";
   }
   async onload() {
     await this.loadSettings();
@@ -214,6 +215,40 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
     const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`(^|\\s)${escaped}(?=\\s|$|[.,;:!?])`, "i");
   }
+  formatTaskTextForMessage(text) {
+    const cleanedTaskId = this.stripTaskIdTag(text);
+    const matcher = this.buildTagMatchRegex(this.settings.globalFilterTag);
+    if (!matcher) {
+      return cleanedTaskId;
+    }
+    const cleaned = cleanedTaskId.replace(matcher, " ").replace(/\s{2,}/g, " ").trim();
+    return cleaned || cleanedTaskId;
+  }
+  buildTaskIdTagRegex(flags = "i") {
+    return new RegExp(`(^|\\s)${this.taskIdTagPrefix.replace("/", "\\/")}[0-9a-f]+(?=\\s|$|[.,;:!?])`, flags);
+  }
+  getStoredTaskId(text) {
+    if (!text) {
+      return null;
+    }
+    const match = text.match(this.buildTaskIdTagRegex("i"));
+    if (!match) {
+      return null;
+    }
+    const idMatch = match[0].match(/[0-9a-f]+/i);
+    return idMatch ? idMatch[0].toLowerCase() : null;
+  }
+  stripTaskIdTag(text) {
+    const cleaned = text.replace(this.buildTaskIdTagRegex("gi"), " ").replace(/\s{2,}/g, " ").trim();
+    return cleaned || text;
+  }
+  ensureTaskIdTag(lineText, id) {
+    if (this.buildTaskIdTagRegex("i").test(lineText)) {
+      return lineText;
+    }
+    const suffix = lineText.endsWith(" ") ? "" : " ";
+    return `${lineText}${suffix}${this.taskIdTagPrefix}${id.toLowerCase()}`;
+  }
   taskMatchesGlobalTag(task, record) {
     var _a, _b, _c, _d;
     const tag = this.normalizeTagFilter(this.settings.globalFilterTag);
@@ -247,7 +282,6 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
     const query = this.normalizeTasksQuery(this.settings.tasksQuery);
     const queryFn = (_b = (_a = api.getTasks) != null ? _a : api.getTasksFromQuery) != null ? _b : api.queryTasks;
     if (!queryFn) {
-      new import_obsidian.Notice("Tasks plugin API does not expose a query method.");
       return null;
     }
     const normalize = (result) => {
@@ -476,9 +510,87 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
     const raw = this.getTaskRaw(task);
     const priority = this.getTaskPriority(task);
     const dueTimestamp = this.getTaskDueTimestamp(task);
-    const id = this.hashTaskId(`${path != null ? path : ""}::${line != null ? line : ""}::${raw != null ? raw : text}`);
+    const storedId = this.getStoredTaskId(raw != null ? raw : text);
+    const id = storedId != null ? storedId : this.hashTaskId(`${path != null ? path : ""}::${line != null ? line : ""}::${raw != null ? raw : text}`);
     const shortId = id.slice(0, 8);
     return { id, shortId, text, path, line, raw, priority, dueTimestamp };
+  }
+  async persistTaskIdTags(records) {
+    var _a;
+    const recordsByPath = /* @__PURE__ */ new Map();
+    for (const record of records) {
+      if (!record.path) {
+        continue;
+      }
+      const existing = (_a = recordsByPath.get(record.path)) != null ? _a : [];
+      existing.push(record);
+      recordsByPath.set(record.path, existing);
+    }
+    const taskRegex = /^\s*-\s*\[ \]\s*/;
+    for (const [path, fileRecords] of recordsByPath) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof import_obsidian.TFile)) {
+        continue;
+      }
+      const contents = await this.app.vault.read(file);
+      const lines = contents.split("\n");
+      let changed = false;
+      const matchesTaskLine = (lineText, record) => {
+        if (!taskRegex.test(lineText)) {
+          return false;
+        }
+        if (record.raw && lineText.includes(record.raw)) {
+          return true;
+        }
+        if (record.text && lineText.includes(record.text)) {
+          return true;
+        }
+        return false;
+      };
+      for (const record of fileRecords) {
+        if (!record.id) {
+          continue;
+        }
+        const candidateIndexes = [];
+        if (typeof record.line === "number") {
+          candidateIndexes.push(record.line, record.line - 1);
+        }
+        let updated = false;
+        for (const index of candidateIndexes) {
+          if (index < 0 || index >= lines.length) {
+            continue;
+          }
+          if (!matchesTaskLine(lines[index], record)) {
+            continue;
+          }
+          if (this.buildTaskIdTagRegex("i").test(lines[index])) {
+            updated = true;
+            break;
+          }
+          lines[index] = this.ensureTaskIdTag(lines[index], record.id);
+          changed = true;
+          updated = true;
+          break;
+        }
+        if (updated) {
+          continue;
+        }
+        for (let i = 0; i < lines.length; i += 1) {
+          if (!matchesTaskLine(lines[i], record)) {
+            continue;
+          }
+          if (this.buildTaskIdTagRegex("i").test(lines[i])) {
+            break;
+          }
+          lines[i] = this.ensureTaskIdTag(lines[i], record.id);
+          changed = true;
+          break;
+        }
+      }
+      if (changed) {
+        await this.app.vault.modify(file, lines.join("\n"));
+      }
+    }
   }
   sortTasks(records) {
     const indexed = records.map((task, index) => ({ task, index }));
@@ -518,6 +630,7 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
       const record = this.toTaskRecord(task);
       return { task, record };
     }).filter(({ task, record }) => this.taskMatchesGlobalTag(task, record)).map(({ record }) => record);
+    await this.persistTaskIdTags(records);
     return this.sortTasks(records);
   }
   async collectTasksFromVault() {
@@ -529,6 +642,7 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
     for (const file of files) {
       const contents = await this.app.vault.read(file);
       const lines = contents.split("\n");
+      let changed = false;
       for (let i = 0; i < lines.length; i += 1) {
         const lineText = lines[i];
         const match = lineText.match(taskRegex);
@@ -539,10 +653,15 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
           continue;
         }
         const text = ((_a = match[1]) == null ? void 0 : _a.trim()) || "(unnamed task)";
-        const id = this.hashTaskId(`${file.path}::${i}::${lineText}`);
+        const storedId = this.getStoredTaskId(lineText);
+        const id = storedId != null ? storedId : this.hashTaskId(`${file.path}::${i}::${lineText}`);
         const shortId = id.slice(0, 8);
         const priority = (_b = this.parsePriorityFromRaw(lineText)) != null ? _b : 0;
         const dueTimestamp = this.parseDueFromRaw(lineText);
+        if (!storedId) {
+          lines[i] = this.ensureTaskIdTag(lineText, id);
+          changed = true;
+        }
         records.push({
           id,
           shortId,
@@ -553,6 +672,9 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
           priority,
           dueTimestamp
         });
+      }
+      if (changed) {
+        await this.app.vault.modify(file, lines.join("\n"));
       }
     }
     return records;
@@ -589,7 +711,7 @@ var TelegramTasksNotifierPlugin = class extends import_obsidian.Plugin {
     const header = `Unfinished tasks: ${tasks.length}`;
     const lines = shownTasks.map((task) => {
       const location = this.settings.includeFilePath && task.path ? ` (${task.path}${task.line !== null ? ":" + task.line : ""})` : "";
-      return `- ${task.text}${location} #${task.shortId}`;
+      return `- ${this.formatTaskTextForMessage(task.text)}${location} #${task.shortId}`;
     });
     const footer = tasks.length > shownTasks.length ? `...and ${tasks.length - shownTasks.length} more` : "";
     const message = [header, "", ...lines, footer].filter(Boolean).join("\n");
