@@ -4,9 +4,35 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
-  TFile,
-  requestUrl
+  TFile
 } from "obsidian";
+import {
+  buildTagMatchRegex,
+  ensureTaskIdTagOnLine,
+  formatTaskTextForMessage,
+  getUncheckedTaskText,
+  hasTaskIdTag,
+  isTaskCompleted,
+  isTaskLike,
+  matchesTaskLine,
+  normalizeTasksQuery,
+  parseDueFromRaw,
+  parsePriorityFromRaw,
+  replaceCheckbox,
+  taskMatchesGlobalTag,
+  toTaskRecord,
+  type TaskRecord,
+  type TaskLike
+} from "./tasks";
+import {
+  DEFAULT_SETTINGS,
+  formatAllowedUserIds,
+  parseAllowedUserIds,
+  type TaskIdTaggingMode,
+  type TelegramTasksNotifierSettings
+} from "./settings";
+import { TelegramClient, type TelegramUpdate } from "./telegram";
+import { getStoredTaskId, hashTaskId } from "./task-id";
 
 type TasksApi = {
   getTasks?: (query: string) => Promise<unknown[]> | unknown[];
@@ -14,121 +40,23 @@ type TasksApi = {
   queryTasks?: (query: string) => Promise<unknown[]> | unknown[];
 };
 
-type TaskRecord = {
-  id: string;
-  shortId: string;
-  text: string;
-  path: string | null;
-  line: number | null;
-  raw: string | null;
-  priority: number;
-  dueTimestamp: number | null;
-};
-
-type TelegramUpdate = {
-  update_id: number;
-  callback_query?: {
-    id: string;
-    data?: string;
-    from?: { id: number; username?: string };
-    message?: { message_id: number; chat?: { id: number } };
-  };
-  message?: {
-    text?: string;
-    chat?: { id: number };
-    from?: { id: number; username?: string };
-  };
-};
-
-interface TelegramTasksNotifierSettings {
-  botToken: string;
-  chatId: string;
-  tasksQuery: string;
-  globalFilterTag: string;
-  notifyOnStartup: boolean;
-  notificationIntervalMinutes: number;
-  pollIntervalSeconds: number;
-  maxTasksPerNotification: number;
-  includeFilePath: boolean;
-  enableTelegramPolling: boolean;
-  lastUpdateId: number;
-}
-
-const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
-  botToken: "",
-  chatId: "",
-  tasksQuery: "not done",
-  globalFilterTag: "",
-  notifyOnStartup: true,
-  notificationIntervalMinutes: 60,
-  pollIntervalSeconds: 10,
-  maxTasksPerNotification: 20,
-  includeFilePath: true,
-  enableTelegramPolling: true,
-  lastUpdateId: 0
-};
-
-class TelegramClient {
-  constructor(private readonly plugin: TelegramTasksNotifierPlugin) {}
-
-  private get apiBase(): string {
-    const token = this.plugin.settings.botToken.trim();
-    return `https://api.telegram.org/bot${token}`;
-  }
-
-  async sendMessage(text: string, replyMarkup?: Record<string, unknown>): Promise<void> {
-    const chatId = this.plugin.settings.chatId.trim();
-    await requestUrl({
-      url: `${this.apiBase}/sendMessage`,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        reply_markup: replyMarkup
-      })
-    });
-  }
-
-  async getUpdates(offset: number): Promise<TelegramUpdate[]> {
-    const response = await requestUrl({
-      url: `${this.apiBase}/getUpdates`,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        offset,
-        timeout: 0,
-        allowed_updates: ["message", "callback_query"]
-      })
-    });
-    const data = response.json as { ok: boolean; result: TelegramUpdate[] };
-    return data?.result ?? [];
-  }
-
-  async answerCallbackQuery(id: string, text?: string): Promise<void> {
-    await requestUrl({
-      url: `${this.apiBase}/answerCallbackQuery`,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        callback_query_id: id,
-        text
-      })
-    });
-  }
-}
+const TELEGRAM_SAFE_MESSAGE_LENGTH = 3900;
+const TELEGRAM_MAX_LINE_LENGTH = 3500;
 
 export default class TelegramTasksNotifierPlugin extends Plugin {
   settings: TelegramTasksNotifierSettings;
   private telegramClient: TelegramClient;
   private notificationIntervalId: number | null = null;
-  private pollingIntervalId: number | null = null;
+  private pollingLoopPromise: Promise<void> | null = null;
+  private pollingAbort = false;
+  private pollingInFlight = false;
+  private sendInFlight = false;
+  private pollingErrorStreak = 0;
   private taskCache = new Map<string, TaskRecord>();
-  private readonly taskIdTagPrefix = "#taskid/";
 
   async onload(): Promise<void> {
     await this.loadSettings();
-    this.telegramClient = new TelegramClient(this);
+    this.telegramClient = new TelegramClient(() => this.settings);
 
     this.addSettingTab(new TelegramTasksNotifierSettingTab(this.app, this));
     this.addCommand({
@@ -177,9 +105,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
 
     if (this.settings.enableTelegramPolling && this.settings.pollIntervalSeconds > 0) {
-      this.pollingIntervalId = window.setInterval(() => {
-        void this.pollTelegramUpdates();
-      }, this.settings.pollIntervalSeconds * 1000);
+      this.startPollingLoop();
     }
   }
 
@@ -188,10 +114,44 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       window.clearInterval(this.notificationIntervalId);
       this.notificationIntervalId = null;
     }
-    if (this.pollingIntervalId !== null) {
-      window.clearInterval(this.pollingIntervalId);
-      this.pollingIntervalId = null;
+    this.stopPollingLoop();
+  }
+
+  private startPollingLoop(): void {
+    if (this.pollingLoopPromise) {
+      return;
     }
+    this.pollingAbort = false;
+    this.pollingLoopPromise = this.pollTelegramUpdatesLoop().finally(() => {
+      this.pollingLoopPromise = null;
+    });
+  }
+
+  private stopPollingLoop(): void {
+    this.pollingAbort = true;
+  }
+
+  private async pollTelegramUpdatesLoop(): Promise<void> {
+    while (!this.pollingAbort && this.settings.enableTelegramPolling) {
+      try {
+        await this.pollTelegramUpdates();
+        this.pollingErrorStreak = 0;
+      } catch (error) {
+        this.pollingErrorStreak += 1;
+        const backoff = this.getPollingBackoffMs(this.pollingErrorStreak);
+        console.warn("Telegram polling failed", error);
+        new Notice("Telegram polling failed. Retrying soon.");
+        await this.sleep(backoff);
+      }
+    }
+  }
+
+  private getPollingBackoffMs(errorStreak: number): number {
+    const baseMs = 1000;
+    const maxMs = 30000;
+    const backoff = baseMs * Math.pow(2, Math.min(4, errorStreak));
+    const jitter = Math.floor(Math.random() * 500);
+    return Math.min(maxMs, backoff + jitter);
   }
 
   async loadSettings(): Promise<void> {
@@ -225,185 +185,37 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return plugin?.apiV1 ?? null;
   }
 
-  private normalizeTasksQuery(input: string): string {
-    const trimmed = input.trim();
-    if (!trimmed) {
-      return "";
+  private normalizeQueryResult(result: unknown): unknown[] {
+    if (Array.isArray(result)) {
+      return result;
     }
-    if (trimmed.startsWith("```")) {
-      const lines = trimmed.split(/\r?\n/);
-      const firstLine = lines[0].replace(/^```/, "").trim();
-      const contentLines = lines.slice(1);
-      if (contentLines.length > 0) {
-        const lastLine = contentLines[contentLines.length - 1].trim();
-        if (lastLine.startsWith("```")) {
-          contentLines.pop();
-        }
+    if (result && typeof result === "object") {
+      const maybeTasks = (result as { tasks?: unknown[] }).tasks;
+      if (Array.isArray(maybeTasks)) {
+        return maybeTasks;
       }
-      if (/^tasks\b/i.test(firstLine)) {
-        const afterTasks = firstLine.replace(/^tasks\b/i, "").trim();
-        if (afterTasks) {
-          contentLines.unshift(afterTasks);
-        }
+      const maybeItems = (result as { items?: unknown[] }).items;
+      if (Array.isArray(maybeItems)) {
+        return maybeItems;
       }
-      return contentLines.join("\n").trim();
-    }
-    if (/^tasks\s+/i.test(trimmed)) {
-      return trimmed.replace(/^tasks\s+/i, "").trim();
-    }
-    return trimmed;
-  }
-
-  private normalizeTagFilter(value: string): string {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return "";
-    }
-    return trimmed.startsWith("#") ? trimmed : `#${trimmed}`;
-  }
-
-  private buildTagMatchRegex(tag: string): RegExp | null {
-    const normalized = this.normalizeTagFilter(tag);
-    if (!normalized) {
-      return null;
-    }
-    const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(^|\\s)${escaped}(?=\\s|$|[.,;:!?])`, "i");
-  }
-
-  private formatTaskTextForMessage(text: string, matcher?: RegExp | null): string {
-    const cleanedTaskId = this.stripTaskIdTag(text);
-    const resolvedMatcher = matcher === undefined
-      ? this.buildTagMatchRegex(this.settings.globalFilterTag)
-      : matcher;
-    if (!resolvedMatcher) {
-      return cleanedTaskId;
-    }
-    const cleaned = cleanedTaskId.replace(resolvedMatcher, " ").replace(/\s{2,}/g, " ").trim();
-    return cleaned || cleanedTaskId;
-  }
-
-  private buildTaskIdTagRegex(flags: "i" | "gi" = "i"): RegExp {
-    return new RegExp(`(^|\\s)${this.taskIdTagPrefix.replace("/", "\\/")}[0-9a-f]+(?=\\s|$|[.,;:!?])`, flags);
-  }
-
-  private getStoredTaskId(text: string | null): string | null {
-    if (!text) {
-      return null;
-    }
-    const match = text.match(this.buildTaskIdTagRegex("i"));
-    if (!match) {
-      return null;
-    }
-    const idMatch = match[0].match(/[0-9a-f]+/i);
-    return idMatch ? idMatch[0].toLowerCase() : null;
-  }
-
-  private stripTaskIdTag(text: string): string {
-    const cleaned = text.replace(this.buildTaskIdTagRegex("gi"), " ").replace(/\s{2,}/g, " ").trim();
-    return cleaned || text;
-  }
-
-  private ensureTaskIdTag(lineText: string, id: string): string {
-    if (this.buildTaskIdTagRegex("i").test(lineText)) {
-      return lineText;
-    }
-    const suffix = lineText.endsWith(" ") ? "" : " ";
-    return `${lineText}${suffix}${this.taskIdTagPrefix}${id.toLowerCase()}`;
-  }
-
-  private taskMatchesGlobalTag(
-    task: Record<string, unknown>,
-    record: TaskRecord,
-    matcher?: RegExp | null
-  ): boolean {
-    const tag = this.normalizeTagFilter(this.settings.globalFilterTag);
-    if (!tag) {
-      return true;
-    }
-    const lowerTag = tag.toLowerCase();
-    const tags = (task as { tags?: unknown }).tags;
-    if (Array.isArray(tags)) {
-      const matchesArray = tags.some((entry) => {
-        if (typeof entry !== "string") {
-          return false;
-        }
-        const normalized = this.normalizeTagFilter(entry).toLowerCase();
-        return normalized === lowerTag;
-      });
-      if (matchesArray) {
-        return true;
+      const maybeResults = (result as { results?: unknown[] }).results;
+      if (Array.isArray(maybeResults)) {
+        return maybeResults;
       }
     }
-    const raw = record.raw ?? this.getTaskRaw(task) ?? "";
-    const text = record.text ?? this.getTaskText(task) ?? "";
-    const resolvedMatcher = matcher === undefined ? this.buildTagMatchRegex(tag) : matcher;
-    if (!resolvedMatcher) {
-      return true;
-    }
-    return resolvedMatcher.test(raw) || resolvedMatcher.test(text);
+    return [];
   }
 
-  private isUncheckedTaskLine(lineText: string): boolean {
-    return /^\s*-\s*\[ \]\s*/.test(lineText);
-  }
-
-  private isTaskLine(lineText: string): boolean {
-    return /^\s*-\s*\[[ xX]\]\s*/.test(lineText);
-  }
-
-  private getUncheckedTaskText(lineText: string): string | null {
-    const match = lineText.match(/^\s*-\s*\[ \]\s*(.*)$/);
-    return match ? match[1] : null;
-  }
-
-  private matchesTaskLine(lineText: string, record: TaskRecord, requireUnchecked: boolean): boolean {
-    if (requireUnchecked) {
-      if (!this.isUncheckedTaskLine(lineText)) {
-        return false;
-      }
-    } else if (!this.isTaskLine(lineText)) {
-      return false;
-    }
-    if (record.raw && lineText.includes(record.raw)) {
-      return true;
-    }
-    if (record.text && lineText.includes(record.text)) {
-      return true;
-    }
-    return false;
-  }
-
-  private async queryTasksFromApi(api: TasksApi): Promise<unknown[] | null> {
-    const query = this.normalizeTasksQuery(this.settings.tasksQuery);
+  private async queryTasksFromApi(api: TasksApi): Promise<TaskLike[] | null> {
+    const query = normalizeTasksQuery(this.settings.tasksQuery);
     const queryFn = api.getTasks ?? api.getTasksFromQuery ?? api.queryTasks;
     if (!queryFn) {
       return null;
     }
-    const normalize = (result: unknown): unknown[] => {
-      if (Array.isArray(result)) {
-        return result;
-      }
-      if (result && typeof result === "object") {
-        const maybeTasks = (result as { tasks?: unknown[] }).tasks;
-        if (Array.isArray(maybeTasks)) {
-          return maybeTasks;
-        }
-        const maybeItems = (result as { items?: unknown[] }).items;
-        if (Array.isArray(maybeItems)) {
-          return maybeItems;
-        }
-        const maybeResults = (result as { results?: unknown[] }).results;
-        if (Array.isArray(maybeResults)) {
-          return maybeResults;
-        }
-      }
-      return [];
-    };
 
     try {
       const result = await queryFn.call(api, query);
-      const tasks = normalize(result);
+      const tasks = this.normalizeQueryResult(result).filter(isTaskLike);
       if (tasks.length > 0 || query.length === 0) {
         return tasks;
       }
@@ -413,264 +225,103 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
     try {
       const result = await queryFn.call(api, { query });
-      return normalize(result);
+      return this.normalizeQueryResult(result).filter(isTaskLike);
     } catch (error) {
       console.warn("Failed Tasks query with object", error);
       return null;
     }
   }
 
-  private isTaskCompleted(task: Record<string, unknown>): boolean {
-    if (task.completed === true || task.isCompleted === true) {
-      return true;
-    }
-    const status = task.status as { type?: string; isCompleted?: boolean } | undefined;
-    if (status?.isCompleted === true) {
-      return true;
-    }
-    if (typeof status?.type === "string" && status.type.toLowerCase() === "done") {
-      return true;
-    }
-    const raw = this.getTaskRaw(task);
-    if (raw && /\[[xX]\]/.test(raw)) {
-      return true;
-    }
-    return false;
+  private shouldPersistTaskIdTags(mode: TaskIdTaggingMode = this.settings.taskIdTaggingMode): boolean {
+    return mode === "always";
   }
 
-  private getTaskText(task: Record<string, unknown>): string {
-    return (
-      (task.description as string) ||
-      (task.text as string) ||
-      (task.task as string) ||
-      (task.content as string) ||
-      this.getTaskRaw(task) ||
-      "(unnamed task)"
-    );
+  private async collectTasks(): Promise<TaskRecord[]> {
+    const api = this.getTasksApi();
+    if (!api) {
+      const tasks = await this.collectTasksFromVault();
+      return this.sortTasks(tasks);
+    }
+
+    const tasks = await this.queryTasksFromApi(api);
+    if (tasks === null) {
+      const fallback = await this.collectTasksFromVault();
+      return this.sortTasks(fallback);
+    }
+
+    const tagMatcher = buildTagMatchRegex(this.settings.globalFilterTag);
+    const records = tasks
+      .filter((task) => !isTaskCompleted(task))
+      .map((task) => {
+        const record = toTaskRecord(task);
+        return { task, record };
+      })
+      .filter(({ task, record }) => taskMatchesGlobalTag(task, record, this.settings.globalFilterTag, tagMatcher))
+      .map(({ record }) => record);
+
+    if (this.shouldPersistTaskIdTags()) {
+      await this.persistTaskIdTags(records);
+    }
+
+    return this.sortTasks(records);
   }
 
-  private getTaskRaw(task: Record<string, unknown>): string | null {
-    return (
-      (task.originalMarkdown as string) ||
-      (task.raw as string) ||
-      (task.lineText as string) ||
-      null
-    );
-  }
+  private async collectTasksFromVault(): Promise<TaskRecord[]> {
+    const records: TaskRecord[] = [];
+    const files = this.app.vault.getMarkdownFiles();
+    const tagRegex = buildTagMatchRegex(this.settings.globalFilterTag);
+    const shouldTag = this.shouldPersistTaskIdTags();
 
-  private getTaskPath(task: Record<string, unknown>): string | null {
-    return (
-      (task.path as string) ||
-      (task.filePath as string) ||
-      ((task.file as { path?: string } | undefined)?.path ?? null)
-    );
-  }
+    for (const file of files) {
+      const contents = await this.app.vault.read(file);
+      const lines = contents.split("\n");
+      let changed = false;
 
-  private getTaskLine(task: Record<string, unknown>): number | null {
-    const line =
-      (task.line as number) ??
-      (task.lineNumber as number) ??
-      (task.position as { start?: { line?: number } } | undefined)?.start?.line ??
-      null;
-    return Number.isFinite(line) ? Number(line) : null;
-  }
+      for (let i = 0; i < lines.length; i += 1) {
+        const lineText = lines[i];
+        const taskText = getUncheckedTaskText(lineText);
+        if (taskText === null) {
+          continue;
+        }
+        if (tagRegex && !tagRegex.test(lineText)) {
+          continue;
+        }
+        const text = taskText.trim() || "(unnamed task)";
+        const storedId = getStoredTaskId(lineText);
+        const id = storedId ?? hashTaskId(`${file.path}::${i}::${lineText}`);
+        const shortId = id.slice(0, 8);
+        const priority = parsePriorityFromRaw(lineText) ?? 0;
+        const dueTimestamp = parseDueFromRaw(lineText);
 
-  private normalizePriority(value: unknown): number | null {
-    if (value === null || value === undefined) {
-      return null;
-    }
-    if (typeof value === "number" && Number.isFinite(value)) {
-      if (value <= 0) {
-        return 0;
-      }
-      if (value >= 4) {
-        return 4;
-      }
-      return Math.round(value);
-    }
-    if (typeof value === "string") {
-      const normalized = value.trim().toLowerCase();
-      if (["highest", "urgent", "top"].includes(normalized)) {
-        return 4;
-      }
-      if (["high"].includes(normalized)) {
-        return 3;
-      }
-      if (["medium", "normal", "default"].includes(normalized)) {
-        return 2;
-      }
-      if (["low"].includes(normalized)) {
-        return 1;
-      }
-      if (["lowest", "none"].includes(normalized)) {
-        return 0;
-      }
-    }
-    if (typeof value === "object") {
-      const record = value as {
-        name?: unknown;
-        label?: unknown;
-        id?: unknown;
-        value?: unknown;
-        priority?: unknown;
-      };
-      return (
-        this.normalizePriority(record.value) ??
-        this.normalizePriority(record.priority) ??
-        this.normalizePriority(record.id) ??
-        this.normalizePriority(record.name) ??
-        this.normalizePriority(record.label)
-      );
-    }
-    return null;
-  }
+        if (shouldTag && !storedId) {
+          lines[i] = ensureTaskIdTagOnLine(lineText, id);
+          changed = true;
+        }
 
-  private parsePriorityFromRaw(raw: string | null): number | null {
-    if (!raw) {
-      return null;
-    }
-    if (raw.includes("\u23EB")) {
-      return 4;
-    }
-    if (raw.includes("\uD83D\uDD3C")) {
-      return 3;
-    }
-    if (raw.includes("\uD83D\uDD3D")) {
-      return 1;
-    }
-    if (raw.includes("\u23EC")) {
-      return 0;
-    }
-    const keywordMatch = raw.match(/\bpriority[:\s]*([a-zA-Z]+)\b/i);
-    if (keywordMatch) {
-      return this.normalizePriority(keywordMatch[1]);
-    }
-    return null;
-  }
+        records.push({
+          id,
+          shortId,
+          text,
+          path: file.path,
+          line: i,
+          raw: lineText,
+          priority,
+          dueTimestamp
+        });
+      }
 
-  private getTaskPriority(task: Record<string, unknown>): number {
-    const fromField =
-      this.normalizePriority(task.priority) ??
-      this.normalizePriority((task as { priorityNumber?: unknown }).priorityNumber) ??
-      this.normalizePriority((task as { priorityValue?: unknown }).priorityValue) ??
-      this.normalizePriority((task as { urgency?: unknown }).urgency);
-    if (fromField !== null) {
-      return fromField;
+      if (changed) {
+        await this.app.vault.modify(file, lines.join("\n"));
+      }
     }
-    const fromRaw = this.parsePriorityFromRaw(this.getTaskRaw(task));
-    return fromRaw ?? 0;
-  }
 
-  private parseDateString(value: string): number | null {
-    const isoMatch = value.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-    if (isoMatch) {
-      const year = Number.parseInt(isoMatch[1], 10);
-      const month = Number.parseInt(isoMatch[2], 10);
-      const day = Number.parseInt(isoMatch[3], 10);
-      if (Number.isFinite(year) && Number.isFinite(month) && Number.isFinite(day)) {
-        return Date.UTC(year, month - 1, day);
-      }
-    }
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-
-  private normalizeDueTimestamp(value: unknown): number | null {
-    if (value === null || value === undefined) {
-      return null;
-    }
-    if (value instanceof Date) {
-      return value.getTime();
-    }
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value > 1_000_000_000_000 ? value : value * 1000;
-    }
-    if (typeof value === "string") {
-      return this.parseDateString(value);
-    }
-    if (typeof value === "object") {
-      const record = value as {
-        toMillis?: () => number;
-        toJSDate?: () => Date;
-        toISO?: () => string;
-        year?: unknown;
-        month?: unknown;
-        day?: unknown;
-        date?: unknown;
-      };
-      if (typeof record.toMillis === "function") {
-        const millis = record.toMillis();
-        return Number.isFinite(millis) ? millis : null;
-      }
-      if (typeof record.toJSDate === "function") {
-        const date = record.toJSDate();
-        return date instanceof Date ? date.getTime() : null;
-      }
-      if (typeof record.toISO === "function") {
-        return this.parseDateString(record.toISO());
-      }
-      if (
-        typeof record.year === "number" &&
-        typeof record.month === "number" &&
-        typeof record.day === "number"
-      ) {
-        return Date.UTC(record.year, record.month - 1, record.day);
-      }
-      if (typeof record.date === "string") {
-        return this.parseDateString(record.date);
-      }
-    }
-    return null;
-  }
-
-  private parseDueFromRaw(raw: string | null): number | null {
-    if (!raw) {
-      return null;
-    }
-    const emojiMatch = raw.match(/\uD83D\uDCC5\s*(\d{4}-\d{2}-\d{2})/);
-    if (emojiMatch) {
-      return this.parseDateString(emojiMatch[1]);
-    }
-    const dueMatch = raw.match(/\bdue[:\s]*([0-9]{4}-[0-9]{2}-[0-9]{2})\b/i);
-    if (dueMatch) {
-      return this.parseDateString(dueMatch[1]);
-    }
-    return null;
-  }
-
-  private getTaskDueTimestamp(task: Record<string, unknown>): number | null {
-    const candidates = [
-      (task as { dueDate?: unknown }).dueDate,
-      (task as { due?: unknown }).due,
-      (task as { dueOn?: unknown }).dueOn,
-      (task as { dueDateTime?: unknown }).dueDateTime,
-      (task as { dueAt?: unknown }).dueAt,
-      (task as { dueDateString?: unknown }).dueDateString,
-      (task as { dates?: { due?: unknown } }).dates?.due
-    ];
-    for (const candidate of candidates) {
-      const normalized = this.normalizeDueTimestamp(candidate);
-      if (normalized !== null) {
-        return normalized;
-      }
-    }
-    return this.parseDueFromRaw(this.getTaskRaw(task));
-  }
-
-  private toTaskRecord(task: Record<string, unknown>): TaskRecord {
-    const text = this.getTaskText(task);
-    const path = this.getTaskPath(task);
-    const line = this.getTaskLine(task);
-    const raw = this.getTaskRaw(task);
-    const priority = this.getTaskPriority(task);
-    const dueTimestamp = this.getTaskDueTimestamp(task);
-    const storedId = this.getStoredTaskId(raw ?? text);
-    const id = storedId ?? this.hashTaskId(`${path ?? ""}::${line ?? ""}::${raw ?? text}`);
-    const shortId = id.slice(0, 8);
-    return { id, shortId, text, path, line, raw, priority, dueTimestamp };
+    return records;
   }
 
   private async persistTaskIdTags(records: TaskRecord[]): Promise<void> {
+    if (!this.shouldPersistTaskIdTags()) {
+      return;
+    }
     const recordsByPath = new Map<string, TaskRecord[]>();
     for (const record of records) {
       if (!record.path) {
@@ -704,14 +355,14 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           if (index < 0 || index >= lines.length) {
             continue;
           }
-          if (!this.matchesTaskLine(lines[index], record, true)) {
+          if (!matchesTaskLine(lines[index], record, true)) {
             continue;
           }
-          if (this.buildTaskIdTagRegex("i").test(lines[index])) {
+          if (hasTaskIdTag(lines[index])) {
             updated = true;
             break;
           }
-          lines[index] = this.ensureTaskIdTag(lines[index], record.id);
+          lines[index] = ensureTaskIdTagOnLine(lines[index], record.id);
           changed = true;
           updated = true;
           break;
@@ -722,13 +373,13 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         }
 
         for (let i = 0; i < lines.length; i += 1) {
-          if (!this.matchesTaskLine(lines[i], record, true)) {
+          if (!matchesTaskLine(lines[i], record, true)) {
             continue;
           }
-          if (this.buildTaskIdTagRegex("i").test(lines[i])) {
+          if (hasTaskIdTag(lines[i])) {
             break;
           }
-          lines[i] = this.ensureTaskIdTag(lines[i], record.id);
+          lines[i] = ensureTaskIdTagOnLine(lines[i], record.id);
           changed = true;
           break;
         }
@@ -756,90 +407,17 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return indexed.map(({ task }) => task);
   }
 
-  private hashTaskId(input: string): string {
-    let hash = 5381;
-    for (let i = 0; i < input.length; i += 1) {
-      hash = (hash * 33) ^ input.charCodeAt(i);
-    }
-    return (hash >>> 0).toString(16).padStart(8, "0") + input.length.toString(16);
-  }
-
-  private async collectTasks(): Promise<TaskRecord[]> {
-    const api = this.getTasksApi();
-    if (!api) {
-      const tasks = await this.collectTasksFromVault();
-      return this.sortTasks(tasks);
-    }
-
-    const tasks = await this.queryTasksFromApi(api);
-    if (tasks === null) {
-      const tasks = await this.collectTasksFromVault();
-      return this.sortTasks(tasks);
-    }
-
-    const tagMatcher = this.buildTagMatchRegex(this.settings.globalFilterTag);
-    const records = tasks
-      .filter((task) => !this.isTaskCompleted(task as Record<string, unknown>))
-      .map((task) => {
-        const record = this.toTaskRecord(task as Record<string, unknown>);
-        return { task: task as Record<string, unknown>, record };
-      })
-      .filter(({ task, record }) => this.taskMatchesGlobalTag(task, record, tagMatcher))
-      .map(({ record }) => record);
-    await this.persistTaskIdTags(records);
-    return this.sortTasks(records);
-  }
-
-  private async collectTasksFromVault(): Promise<TaskRecord[]> {
-    const records: TaskRecord[] = [];
-    const files = this.app.vault.getMarkdownFiles();
-    const tagRegex = this.buildTagMatchRegex(this.settings.globalFilterTag);
-
-    for (const file of files) {
-      const contents = await this.app.vault.read(file);
-      const lines = contents.split("\n");
-      let changed = false;
-      for (let i = 0; i < lines.length; i += 1) {
-        const lineText = lines[i];
-        const taskText = this.getUncheckedTaskText(lineText);
-        if (taskText === null) {
-          continue;
-        }
-        if (tagRegex && !tagRegex.test(lineText)) {
-          continue;
-        }
-        const text = taskText.trim() || "(unnamed task)";
-        const storedId = this.getStoredTaskId(lineText);
-        const id = storedId ?? this.hashTaskId(`${file.path}::${i}::${lineText}`);
-        const shortId = id.slice(0, 8);
-        const priority = this.parsePriorityFromRaw(lineText) ?? 0;
-        const dueTimestamp = this.parseDueFromRaw(lineText);
-        if (!storedId) {
-          lines[i] = this.ensureTaskIdTag(lineText, id);
-          changed = true;
-        }
-        records.push({
-          id,
-          shortId,
-          text,
-          path: file.path,
-          line: i,
-          raw: lineText,
-          priority,
-          dueTimestamp
-        });
-      }
-      if (changed) {
-        await this.app.vault.modify(file, lines.join("\n"));
-      }
-    }
-
-    return records;
-  }
-
   async sendTasksNotification(): Promise<void> {
-    const tasks = await this.collectTasks();
-    await this.sendTasksNotificationWithTasks(tasks);
+    if (this.sendInFlight) {
+      return;
+    }
+    this.sendInFlight = true;
+    try {
+      const tasks = await this.collectTasks();
+      await this.sendTasksNotificationWithTasks(tasks);
+    } finally {
+      this.sendInFlight = false;
+    }
   }
 
   private async sendTasksNotificationWithRetry(): Promise<void> {
@@ -872,18 +450,22 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
     const maxTasks = Math.max(1, this.settings.maxTasksPerNotification);
     const shownTasks = tasks.slice(0, maxTasks);
-    const tagMatcher = this.buildTagMatchRegex(this.settings.globalFilterTag);
+    const tagMatcher = buildTagMatchRegex(this.settings.globalFilterTag);
     const header = `Unfinished tasks: ${tasks.length}`;
     const lines = shownTasks.map((task) => {
       const location = this.settings.includeFilePath && task.path
         ? ` (${task.path}${task.line !== null ? ":" + (task.line + 1) : ""})`
         : "";
-      return `- ${this.formatTaskTextForMessage(task.text, tagMatcher)}${location} #${task.shortId}`;
+      return `- ${formatTaskTextForMessage(task.text, tagMatcher)}${location} #${task.shortId}`;
     });
     const footer = tasks.length > shownTasks.length
       ? `...and ${tasks.length - shownTasks.length} more`
       : "";
-    const message = [header, "", ...lines, footer].filter(Boolean).join("\n");
+
+    const messages = this.buildTelegramMessages(header, lines, footer);
+    if (messages.length === 0) {
+      return;
+    }
 
     const replyMarkup = {
       inline_keyboard: shownTasks.map((task) => [
@@ -894,11 +476,97 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       ])
     };
 
-    await this.telegramClient.sendMessage(message, replyMarkup);
+    for (let i = 0; i < messages.length; i += 1) {
+      const text = messages[i];
+      const markup = i === 0 ? replyMarkup : undefined;
+      const sent = await this.safeTelegramCall("send message", () => this.telegramClient.sendMessage(text, markup));
+      if (!sent) {
+        return;
+      }
+    }
+  }
+
+  private buildTelegramMessages(header: string, lines: string[], footer: string): string[] {
+    const messages: string[] = [];
+    const continuedHeader = "Unfinished tasks (continued):";
+
+    let buffer: string[] = [header, ""];
+    let currentLength = buffer.join("\n").length;
+
+    const pushBuffer = (): void => {
+      const text = buffer.join("\n").trimEnd();
+      if (text) {
+        messages.push(text);
+      }
+    };
+
+    const addLine = (line: string): void => {
+      const trimmedLine = line.length > TELEGRAM_MAX_LINE_LENGTH
+        ? `${line.slice(0, TELEGRAM_MAX_LINE_LENGTH - 3)}...`
+        : line;
+      const nextLength = currentLength + trimmedLine.length + 1;
+      if (nextLength > TELEGRAM_SAFE_MESSAGE_LENGTH) {
+        pushBuffer();
+        buffer = [continuedHeader, ""];
+        currentLength = buffer.join("\n").length;
+      }
+      buffer.push(trimmedLine);
+      currentLength += trimmedLine.length + 1;
+    };
+
+    for (const line of lines) {
+      addLine(line);
+    }
+
+    if (footer) {
+      const footerLength = currentLength + footer.length + 1;
+      if (footerLength > TELEGRAM_SAFE_MESSAGE_LENGTH) {
+        pushBuffer();
+        buffer = [continuedHeader, ""];
+        currentLength = buffer.join("\n").length;
+      }
+      buffer.push(footer);
+    }
+
+    pushBuffer();
+    return messages;
+  }
+
+  private async safeTelegramCall<T>(label: string, action: () => Promise<T>): Promise<T | null> {
+    try {
+      return await action();
+    } catch (error) {
+      console.warn(`Telegram ${label} failed`, error);
+      new Notice(`Telegram ${label} failed. Check your connection or bot settings.`);
+      return null;
+    }
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  private isAllowedChatId(chatId: number | undefined | null): boolean {
+    const configured = this.settings.chatId.trim();
+    if (!configured || chatId === undefined || chatId === null) {
+      return false;
+    }
+    return String(chatId) === configured;
+  }
+
+  private isAllowedTelegramUser(userId: number | undefined | null): boolean {
+    if (userId === undefined || userId === null) {
+      return false;
+    }
+    const allowed = this.settings.allowedTelegramUserIds;
+    if (!allowed || allowed.length === 0) {
+      return true;
+    }
+    return allowed.includes(userId);
+  }
+
+  private isAuthorizedUpdate(chatId: number | undefined | null, userId: number | undefined | null): boolean {
+    return this.isAllowedChatId(chatId) && this.isAllowedTelegramUser(userId);
   }
 
   private async pollTelegramUpdates(): Promise<void> {
@@ -908,38 +576,69 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     if (!this.settings.botToken.trim() || !this.settings.chatId.trim()) {
       return;
     }
-    const offset = this.settings.lastUpdateId + 1;
-    const updates = await this.telegramClient.getUpdates(offset);
-    if (updates.length === 0) {
+    if (this.pollingInFlight) {
+      return;
+    }
+    if (this.settings.pollIntervalSeconds <= 0) {
       return;
     }
 
-    let latestUpdateId = this.settings.lastUpdateId;
-    for (const update of updates) {
-      latestUpdateId = Math.max(latestUpdateId, update.update_id);
-
-      if (update.callback_query?.data?.startsWith("done:")) {
-        const taskId = update.callback_query.data.slice("done:".length);
-        const success = await this.completeTaskById(taskId);
-        await this.telegramClient.answerCallbackQuery(
-          update.callback_query.id,
-          success ? "Task marked complete" : "Task not found"
-        );
-        continue;
+    this.pollingInFlight = true;
+    try {
+      const offset = this.settings.lastUpdateId + 1;
+      const timeoutSeconds = Math.max(1, this.settings.pollIntervalSeconds);
+      const updates = await this.telegramClient.getUpdates(offset, timeoutSeconds);
+      if (updates.length === 0) {
+        return;
       }
 
-      const messageText = update.message?.text ?? "";
-      const chatId = update.message?.chat?.id;
-      if (chatId && String(chatId) === this.settings.chatId.trim()) {
+      let latestUpdateId = this.settings.lastUpdateId;
+      for (const update of updates) {
+        latestUpdateId = Math.max(latestUpdateId, update.update_id);
+
+        const callback = update.callback_query;
+        if (callback?.data?.startsWith("done:")) {
+          const taskId = callback.data.slice("done:".length);
+          const callbackChatId = callback.message?.chat?.id;
+          const callbackUserId = callback.from?.id;
+
+          if (!this.isAuthorizedUpdate(callbackChatId, callbackUserId)) {
+            await this.safeTelegramCall("answer callback query", () =>
+              this.telegramClient.answerCallbackQuery(callback.id, "Unauthorized")
+            );
+            continue;
+          }
+
+          const success = await this.completeTaskById(taskId);
+          await this.safeTelegramCall("answer callback query", () =>
+            this.telegramClient.answerCallbackQuery(
+              callback.id,
+              success ? "Task marked complete" : "Task not found"
+            )
+          );
+          continue;
+        }
+
+        const messageText = update.message?.text ?? "";
+        const chatId = update.message?.chat?.id;
+        const userId = update.message?.from?.id;
+        if (!this.isAuthorizedUpdate(chatId, userId)) {
+          continue;
+        }
+
         const match = messageText.match(/^\s*done\s+([a-f0-9]+)\s*$/i);
         if (match) {
           await this.completeTaskById(match[1]);
         }
       }
-    }
 
-    this.settings.lastUpdateId = latestUpdateId;
-    await this.saveSettings();
+      if (latestUpdateId !== this.settings.lastUpdateId) {
+        this.settings.lastUpdateId = latestUpdateId;
+        await this.saveSettings();
+      }
+    } finally {
+      this.pollingInFlight = false;
+    }
   }
 
   async detectTelegramChatId(): Promise<void> {
@@ -948,35 +647,47 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       return;
     }
 
-    const updates = await this.telegramClient.getUpdates(0);
+    const updates = await this.telegramClient.getUpdates(0, 0);
     if (updates.length === 0) {
       new Notice("No Telegram updates found. Send /start to the bot first.");
       return;
     }
 
+    const ordered = [...updates].sort((a, b) => a.update_id - b.update_id);
     let latestUpdateId = this.settings.lastUpdateId;
     let detectedChatId: number | null = null;
+    let startChatId: number | null = null;
 
-    for (const update of updates) {
+    for (const update of ordered) {
       latestUpdateId = Math.max(latestUpdateId, update.update_id);
-      const chatId =
-        update.message?.chat?.id ??
-        update.callback_query?.message?.chat?.id ??
-        null;
-      if (chatId !== null) {
-        detectedChatId = chatId;
+      const messageChatId = update.message?.chat?.id ?? null;
+      const callbackChatId = update.callback_query?.message?.chat?.id ?? null;
+
+      if (update.message?.text && /^\s*\/start\b/i.test(update.message.text)) {
+        startChatId = messageChatId;
+      }
+
+      if (messageChatId !== null) {
+        detectedChatId = messageChatId;
+      } else if (callbackChatId !== null) {
+        detectedChatId = callbackChatId;
       }
     }
 
-    if (detectedChatId === null) {
+    const resolvedChatId = startChatId ?? detectedChatId;
+    if (resolvedChatId === null) {
       new Notice("No chat ID found in updates.");
       return;
     }
 
-    this.settings.chatId = String(detectedChatId);
+    if (!startChatId) {
+      new Notice("No /start message found. Using latest chat ID from updates.");
+    }
+
+    this.settings.chatId = String(resolvedChatId);
     this.settings.lastUpdateId = latestUpdateId;
     await this.saveSettings();
-    new Notice(`Telegram chat ID set to ${detectedChatId}`);
+    new Notice(`Telegram chat ID set to ${resolvedChatId}`);
   }
 
   private async completeTaskById(taskId: string): Promise<boolean> {
@@ -1014,42 +725,41 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
     const contents = await this.app.vault.read(file);
     const lines = contents.split("\n");
+    const shouldTag = this.settings.taskIdTaggingMode !== "never";
 
     const candidateIndexes: number[] = [];
     if (typeof task.line === "number") {
       candidateIndexes.push(task.line, task.line - 1);
     }
 
-    const replaceCheckbox = (lineText: string): string | null => {
-      if (!/\[[^\]]\]/.test(lineText)) {
-        return null;
-      }
-      const updated = lineText.replace(/\[[^\]]\]/, "[x]");
-      return updated === lineText ? null : updated;
-    };
-
     for (const index of candidateIndexes) {
       if (index < 0 || index >= lines.length) {
         continue;
       }
-      if (!this.matchesTaskLine(lines[index], task, false)) {
+      if (!matchesTaskLine(lines[index], task, false)) {
         continue;
       }
       const updated = replaceCheckbox(lines[index]);
       if (updated) {
-        lines[index] = updated;
+        const nextLine = shouldTag && !hasTaskIdTag(updated)
+          ? ensureTaskIdTagOnLine(updated, task.id)
+          : updated;
+        lines[index] = nextLine;
         await this.app.vault.modify(file, lines.join("\n"));
         return true;
       }
     }
 
     for (let i = 0; i < lines.length; i += 1) {
-      if (!this.matchesTaskLine(lines[i], task, false)) {
+      if (!matchesTaskLine(lines[i], task, false)) {
         continue;
       }
       const updated = replaceCheckbox(lines[i]);
       if (updated) {
-        lines[i] = updated;
+        const nextLine = shouldTag && !hasTaskIdTag(updated)
+          ? ensureTaskIdTagOnLine(updated, task.id)
+          : updated;
+        lines[i] = nextLine;
         await this.app.vault.modify(file, lines.join("\n"));
         return true;
       }
@@ -1124,6 +834,34 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Allowed Telegram user IDs")
+      .setDesc("Optional comma-separated user IDs allowed to mark tasks complete.")
+      .addText((text) =>
+        text
+          .setPlaceholder("123456, 789012")
+          .setValue(formatAllowedUserIds(this.plugin.settings.allowedTelegramUserIds))
+          .onChange(async (value) => {
+            this.plugin.settings.allowedTelegramUserIds = parseAllowedUserIds(value);
+            await this.plugin.saveSettingsAndReconfigure();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Task ID tagging mode")
+      .setDesc("Controls when #taskid tags are written to task lines.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("always", "Always")
+          .addOption("on-complete", "Only on completion")
+          .addOption("never", "Never")
+          .setValue(this.plugin.settings.taskIdTaggingMode)
+          .onChange(async (value) => {
+            this.plugin.settings.taskIdTaggingMode = value as TaskIdTaggingMode;
+            await this.plugin.saveSettingsAndReconfigure();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("Notify on startup")
       .setDesc("Send tasks notification when Obsidian starts.")
       .addToggle((toggle) =>
@@ -1163,7 +901,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Polling interval (seconds)")
-      .setDesc("How often to poll Telegram for updates.")
+      .setDesc("How long Telegram long-polls for updates.")
       .addText((text) =>
         text
           .setPlaceholder("10")
