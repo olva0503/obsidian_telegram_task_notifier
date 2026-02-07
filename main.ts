@@ -435,7 +435,10 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
   }
 
-  private async sendTasksNotificationWithTasks(tasks: TaskRecord[]): Promise<void> {
+  private async sendTasksNotificationWithTasks(
+    tasks: TaskRecord[],
+    options: { allowEmpty?: boolean } = {}
+  ): Promise<void> {
     if (!this.settings.botToken.trim() || !this.settings.chatId.trim()) {
       new Notice("Telegram bot token or chat ID is missing.");
       return;
@@ -445,7 +448,13 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     tasks.forEach((task) => this.taskCache.set(task.id, task));
 
     if (tasks.length === 0) {
-      new Notice("No unfinished tasks found.");
+      if (options.allowEmpty) {
+        await this.safeTelegramCall("send message", () =>
+          this.telegramClient.sendMessage("No unfinished tasks found.")
+        );
+      } else {
+        new Notice("No unfinished tasks found.");
+      }
       return;
     }
 
@@ -469,12 +478,20 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
 
     const replyMarkup = {
-      inline_keyboard: shownTasks.map((task) => [
-        {
-          text: `Done #${task.shortId}`,
-          callback_data: `done:${task.id}`
-        }
-      ])
+      inline_keyboard: [
+        ...shownTasks.map((task) => [
+          {
+            text: `Done #${task.shortId}`,
+            callback_data: `done:${task.id}`
+          }
+        ]),
+        [
+          {
+            text: "List",
+            callback_data: "list"
+          }
+        ]
+      ]
     };
 
     for (let i = 0; i < messages.length; i += 1) {
@@ -598,6 +615,25 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         latestUpdateId = Math.max(latestUpdateId, update.update_id);
 
         const callback = update.callback_query;
+        if (callback?.data === "list") {
+          const callbackChatId = callback.message?.chat?.id;
+          const callbackUserId = callback.from?.id;
+
+          if (!this.isAuthorizedUpdate(callbackChatId, callbackUserId)) {
+            await this.safeTelegramCall("answer callback query", () =>
+              this.telegramClient.answerCallbackQuery(callback.id, "Unauthorized")
+            );
+            continue;
+          }
+
+          const tasks = await this.collectTasks();
+          await this.sendTasksNotificationWithTasks(tasks, { allowEmpty: true });
+          await this.safeTelegramCall("answer callback query", () =>
+            this.telegramClient.answerCallbackQuery(callback.id, "Sent task list")
+          );
+          continue;
+        }
+
         if (callback?.data?.startsWith("done:")) {
           const taskId = callback.data.slice("done:".length);
           const callbackChatId = callback.message?.chat?.id;
@@ -627,9 +663,16 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           continue;
         }
 
-        const match = messageText.match(/^\s*done\s+([a-f0-9]+)\s*$/i);
-        if (match) {
-          await this.completeTaskById(match[1]);
+        const listMatch = messageText.match(/^\s*\/list(?:@\S+)?\s*$/i);
+        if (listMatch) {
+          const tasks = await this.collectTasks();
+          await this.sendTasksNotificationWithTasks(tasks, { allowEmpty: true });
+          continue;
+        }
+
+        const doneMatch = messageText.match(/^\s*done\s+([a-f0-9]+)\s*$/i);
+        if (doneMatch) {
+          await this.completeTaskById(doneMatch[1]);
         }
       }
 

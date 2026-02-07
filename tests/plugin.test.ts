@@ -36,6 +36,49 @@ const createApp = (files: Record<string, string>) => {
 };
 
 describe("TelegramTasksNotifierPlugin", () => {
+  it("responds to /list by sending unfinished tasks", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      chatId: "123",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 5
+    };
+
+    const sent: Array<{ text: string; markup?: unknown }> = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 5,
+          message: {
+            text: "/list",
+            chat: { id: 123 },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessage: async (text: string, reply_markup?: unknown) => {
+        sent.push({ text, markup: reply_markup });
+      },
+      answerCallbackQuery: async () => {}
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(sent.length).toBe(1);
+    expect(sent[0].text).toContain("Unfinished tasks: 1");
+    expect(sent[0].text).toContain("Task one");
+    const keyboard = (sent[0].markup as { inline_keyboard?: Array<Array<{ text?: string }>> })?.inline_keyboard;
+    expect(keyboard?.length).toBe(2);
+    expect(keyboard?.[1]?.[0]?.text).toBe("List");
+  });
+
   it("collects tasks from vault and persists task IDs", async () => {
     const app = createApp({
       "Notes.md": "- [ ] Task one #work\n- [ ] Task two #home"
