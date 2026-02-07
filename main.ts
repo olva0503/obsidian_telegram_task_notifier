@@ -200,6 +200,10 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  async saveSettingsAndReconfigure(): Promise<void> {
+    await this.saveSettings();
     this.configureIntervals();
   }
 
@@ -267,13 +271,15 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return new RegExp(`(^|\\s)${escaped}(?=\\s|$|[.,;:!?])`, "i");
   }
 
-  private formatTaskTextForMessage(text: string): string {
+  private formatTaskTextForMessage(text: string, matcher?: RegExp | null): string {
     const cleanedTaskId = this.stripTaskIdTag(text);
-    const matcher = this.buildTagMatchRegex(this.settings.globalFilterTag);
-    if (!matcher) {
+    const resolvedMatcher = matcher === undefined
+      ? this.buildTagMatchRegex(this.settings.globalFilterTag)
+      : matcher;
+    if (!resolvedMatcher) {
       return cleanedTaskId;
     }
-    const cleaned = cleanedTaskId.replace(matcher, " ").replace(/\s{2,}/g, " ").trim();
+    const cleaned = cleanedTaskId.replace(resolvedMatcher, " ").replace(/\s{2,}/g, " ").trim();
     return cleaned || cleanedTaskId;
   }
 
@@ -306,7 +312,11 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return `${lineText}${suffix}${this.taskIdTagPrefix}${id.toLowerCase()}`;
   }
 
-  private taskMatchesGlobalTag(task: Record<string, unknown>, record: TaskRecord): boolean {
+  private taskMatchesGlobalTag(
+    task: Record<string, unknown>,
+    record: TaskRecord,
+    matcher?: RegExp | null
+  ): boolean {
     const tag = this.normalizeTagFilter(this.settings.globalFilterTag);
     if (!tag) {
       return true;
@@ -327,11 +337,41 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
     const raw = record.raw ?? this.getTaskRaw(task) ?? "";
     const text = record.text ?? this.getTaskText(task) ?? "";
-    const matcher = this.buildTagMatchRegex(tag);
-    if (!matcher) {
+    const resolvedMatcher = matcher === undefined ? this.buildTagMatchRegex(tag) : matcher;
+    if (!resolvedMatcher) {
       return true;
     }
-    return matcher.test(raw) || matcher.test(text);
+    return resolvedMatcher.test(raw) || resolvedMatcher.test(text);
+  }
+
+  private isUncheckedTaskLine(lineText: string): boolean {
+    return /^\s*-\s*\[ \]\s*/.test(lineText);
+  }
+
+  private isTaskLine(lineText: string): boolean {
+    return /^\s*-\s*\[[ xX]\]\s*/.test(lineText);
+  }
+
+  private getUncheckedTaskText(lineText: string): string | null {
+    const match = lineText.match(/^\s*-\s*\[ \]\s*(.*)$/);
+    return match ? match[1] : null;
+  }
+
+  private matchesTaskLine(lineText: string, record: TaskRecord, requireUnchecked: boolean): boolean {
+    if (requireUnchecked) {
+      if (!this.isUncheckedTaskLine(lineText)) {
+        return false;
+      }
+    } else if (!this.isTaskLine(lineText)) {
+      return false;
+    }
+    if (record.raw && lineText.includes(record.raw)) {
+      return true;
+    }
+    if (record.text && lineText.includes(record.text)) {
+      return true;
+    }
+    return false;
   }
 
   private async queryTasksFromApi(api: TasksApi): Promise<unknown[] | null> {
@@ -641,8 +681,6 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       recordsByPath.set(record.path, existing);
     }
 
-    const taskRegex = /^\s*-\s*\[ \]\s*/;
-
     for (const [path, fileRecords] of recordsByPath) {
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof TFile)) {
@@ -651,19 +689,6 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       const contents = await this.app.vault.read(file);
       const lines = contents.split("\n");
       let changed = false;
-
-      const matchesTaskLine = (lineText: string, record: TaskRecord): boolean => {
-        if (!taskRegex.test(lineText)) {
-          return false;
-        }
-        if (record.raw && lineText.includes(record.raw)) {
-          return true;
-        }
-        if (record.text && lineText.includes(record.text)) {
-          return true;
-        }
-        return false;
-      };
 
       for (const record of fileRecords) {
         if (!record.id) {
@@ -679,7 +704,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           if (index < 0 || index >= lines.length) {
             continue;
           }
-          if (!matchesTaskLine(lines[index], record)) {
+          if (!this.matchesTaskLine(lines[index], record, true)) {
             continue;
           }
           if (this.buildTaskIdTagRegex("i").test(lines[index])) {
@@ -697,7 +722,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         }
 
         for (let i = 0; i < lines.length; i += 1) {
-          if (!matchesTaskLine(lines[i], record)) {
+          if (!this.matchesTaskLine(lines[i], record, true)) {
             continue;
           }
           if (this.buildTaskIdTagRegex("i").test(lines[i])) {
@@ -752,13 +777,14 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       return this.sortTasks(tasks);
     }
 
+    const tagMatcher = this.buildTagMatchRegex(this.settings.globalFilterTag);
     const records = tasks
       .filter((task) => !this.isTaskCompleted(task as Record<string, unknown>))
       .map((task) => {
         const record = this.toTaskRecord(task as Record<string, unknown>);
         return { task: task as Record<string, unknown>, record };
       })
-      .filter(({ task, record }) => this.taskMatchesGlobalTag(task, record))
+      .filter(({ task, record }) => this.taskMatchesGlobalTag(task, record, tagMatcher))
       .map(({ record }) => record);
     await this.persistTaskIdTags(records);
     return this.sortTasks(records);
@@ -767,7 +793,6 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   private async collectTasksFromVault(): Promise<TaskRecord[]> {
     const records: TaskRecord[] = [];
     const files = this.app.vault.getMarkdownFiles();
-    const taskRegex = /^\s*-\s*\[ \]\s*(.*)$/;
     const tagRegex = this.buildTagMatchRegex(this.settings.globalFilterTag);
 
     for (const file of files) {
@@ -776,14 +801,14 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       let changed = false;
       for (let i = 0; i < lines.length; i += 1) {
         const lineText = lines[i];
-        const match = lineText.match(taskRegex);
-        if (!match) {
+        const taskText = this.getUncheckedTaskText(lineText);
+        if (taskText === null) {
           continue;
         }
         if (tagRegex && !tagRegex.test(lineText)) {
           continue;
         }
-        const text = match[1]?.trim() || "(unnamed task)";
+        const text = taskText.trim() || "(unnamed task)";
         const storedId = this.getStoredTaskId(lineText);
         const id = storedId ?? this.hashTaskId(`${file.path}::${i}::${lineText}`);
         const shortId = id.slice(0, 8);
@@ -847,12 +872,13 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
     const maxTasks = Math.max(1, this.settings.maxTasksPerNotification);
     const shownTasks = tasks.slice(0, maxTasks);
+    const tagMatcher = this.buildTagMatchRegex(this.settings.globalFilterTag);
     const header = `Unfinished tasks: ${tasks.length}`;
     const lines = shownTasks.map((task) => {
       const location = this.settings.includeFilePath && task.path
-        ? ` (${task.path}${task.line !== null ? ":" + task.line : ""})`
+        ? ` (${task.path}${task.line !== null ? ":" + (task.line + 1) : ""})`
         : "";
-      return `- ${this.formatTaskTextForMessage(task.text)}${location} #${task.shortId}`;
+      return `- ${this.formatTaskTextForMessage(task.text, tagMatcher)}${location} #${task.shortId}`;
     });
     const footer = tasks.length > shownTasks.length
       ? `...and ${tasks.length - shownTasks.length} more`
@@ -994,16 +1020,6 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       candidateIndexes.push(task.line, task.line - 1);
     }
 
-    const matchesTaskLine = (lineText: string): boolean => {
-      if (task.raw && lineText.includes(task.raw)) {
-        return true;
-      }
-      if (task.text && lineText.includes(task.text)) {
-        return true;
-      }
-      return false;
-    };
-
     const replaceCheckbox = (lineText: string): string | null => {
       if (!/\[[^\]]\]/.test(lineText)) {
         return null;
@@ -1016,7 +1032,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       if (index < 0 || index >= lines.length) {
         continue;
       }
-      if (!matchesTaskLine(lines[index]) && task.raw) {
+      if (!this.matchesTaskLine(lines[index], task, false)) {
         continue;
       }
       const updated = replaceCheckbox(lines[index]);
@@ -1028,7 +1044,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
 
     for (let i = 0; i < lines.length; i += 1) {
-      if (!matchesTaskLine(lines[i])) {
+      if (!this.matchesTaskLine(lines[i], task, false)) {
         continue;
       }
       const updated = replaceCheckbox(lines[i]);
@@ -1063,7 +1079,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.tasksQuery)
           .onChange(async (value) => {
             this.plugin.settings.tasksQuery = value;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1076,7 +1092,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.globalFilterTag)
           .onChange(async (value) => {
             this.plugin.settings.globalFilterTag = value.trim();
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1089,7 +1105,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.botToken)
           .onChange(async (value) => {
             this.plugin.settings.botToken = value.trim();
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
             await this.plugin.maybeDetectTelegramChatId();
           })
       );
@@ -1103,7 +1119,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.chatId)
           .onChange(async (value) => {
             this.plugin.settings.chatId = value.trim();
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1115,7 +1131,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.notifyOnStartup)
           .onChange(async (value) => {
             this.plugin.settings.notifyOnStartup = value;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1129,7 +1145,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             const parsed = Number.parseInt(value, 10);
             this.plugin.settings.notificationIntervalMinutes = Number.isFinite(parsed) ? parsed : 0;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1141,7 +1157,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.enableTelegramPolling)
           .onChange(async (value) => {
             this.plugin.settings.enableTelegramPolling = value;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1155,7 +1171,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             const parsed = Number.parseInt(value, 10);
             this.plugin.settings.pollIntervalSeconds = Number.isFinite(parsed) ? parsed : 10;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1169,7 +1185,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             const parsed = Number.parseInt(value, 10);
             this.plugin.settings.maxTasksPerNotification = Number.isFinite(parsed) ? parsed : 20;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
 
@@ -1181,7 +1197,7 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.includeFilePath)
           .onChange(async (value) => {
             this.plugin.settings.includeFilePath = value;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettingsAndReconfigure();
           })
       );
   }
