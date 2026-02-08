@@ -7,6 +7,7 @@ Send your unfinished Obsidian Tasks to Telegram and mark them complete right fro
 - Sends unfinished tasks on demand, on startup, and on a schedule.
 - Pulls tasks from the Tasks plugin API when available, with a vault scan fallback.
 - Inline Telegram buttons to mark tasks as done.
+- Create new tasks from Telegram (stored in your latest daily note) with optional due date and priority.
 - Optional global tag filter (e.g. `#work`) to limit what gets sent.
 - Task ID tagging to reliably complete tasks from Telegram.
 - Optional file path and line number in messages.
@@ -16,6 +17,7 @@ Send your unfinished Obsidian Tasks to Telegram and mark them complete right fro
 - Obsidian 1.4.0+
 - Telegram bot token (via BotFather)
 - Telegram chat ID
+- Daily Notes plugin enabled (for Telegram task creation)
 - (Optional) Tasks plugin for richer querying
 
 ## Installation
@@ -66,6 +68,8 @@ In Telegram:
 
 - Tap `Done #<id>` to mark a task complete.
 - Send `done <id>` to mark a task complete manually.
+- Send any message to create a new task in the latest daily note.
+  - Optional metadata: `due:YYYY-MM-DD` and `priority: high|medium|low|urgent` (or `p0`-`p4`).
 
 ## Development
 

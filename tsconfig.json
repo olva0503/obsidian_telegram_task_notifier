@@ -14,7 +14,8 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["vitest/globals"],
     "paths": {
-      "obsidian": ["tests/obsidian.ts"]
+      "obsidian": ["tests/obsidian.ts"],
+      "obsidian-daily-notes-interface": ["tests/daily-notes-interface.ts"]
     }
   },
   "include": ["*.ts", "tests/**/*.ts", "tests/**/*.d.ts", "vitest.config.ts"]

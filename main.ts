@@ -1,5 +1,6 @@
 import {
   App,
+  moment,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -9,6 +10,7 @@ import {
 import {
   buildTagMatchRegex,
   ensureTaskIdTagOnLine,
+  buildTaskLineFromInput,
   formatTaskTextForMessage,
   getUncheckedTaskText,
   hasTaskIdTag,
@@ -17,6 +19,7 @@ import {
   isTaskLike,
   matchesTaskLine,
   normalizeTasksQuery,
+  normalizeTagFilter,
   parseDueFromRaw,
   parsePriorityFromRaw,
   replaceCheckbox,
@@ -34,6 +37,19 @@ import {
 } from "./settings";
 import { TelegramClient, type TelegramUpdate } from "./telegram";
 import { buildTaskIdTagRegexForId, getStoredTaskId, hashTaskId } from "./task-id";
+import * as dailyNotesInterface from "obsidian-daily-notes-interface";
+
+type DailyNoteSettings = {
+  folder?: string;
+  format?: string;
+  template?: string;
+};
+
+const dailyNotesApi = dailyNotesInterface as {
+  getDailyNoteSettings?: () => DailyNoteSettings | null;
+  getAllDailyNotes?: () => Record<string, TFile> | Map<string, TFile> | null;
+  createDailyNote?: (date: unknown, settings: DailyNoteSettings) => Promise<TFile>;
+};
 
 type TasksApi = {
   getTasks?: (query: string) => Promise<unknown[]> | unknown[];
@@ -659,12 +675,19 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         const messageText = update.message?.text ?? "";
         const chatId = update.message?.chat?.id;
         const userId = update.message?.from?.id;
-        if (!this.isAuthorizedUpdate(chatId, userId)) {
+        const isBot = update.message?.from?.is_bot;
+        if (!this.isAllowedChatId(chatId)) {
+          continue;
+        }
+        if (isBot) {
           continue;
         }
 
         const listMatch = messageText.match(/^\s*\/list(?:@\S+)?\s*$/i);
         if (listMatch) {
+          if (!this.isAllowedTelegramUser(userId)) {
+            continue;
+          }
           const tasks = await this.collectTasks();
           await this.sendTasksNotificationWithTasks(tasks, { allowEmpty: true });
           continue;
@@ -672,8 +695,19 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
         const doneMatch = messageText.match(/^\s*done\s+([a-f0-9]+)\s*$/i);
         if (doneMatch) {
+          if (!this.isAllowedTelegramUser(userId)) {
+            continue;
+          }
           await this.completeTaskById(doneMatch[1]);
+          continue;
         }
+
+        const trimmedMessage = messageText.trim();
+        if (!trimmedMessage || trimmedMessage.startsWith("/")) {
+          continue;
+        }
+
+        await this.addTaskFromTelegram(trimmedMessage);
       }
 
       if (latestUpdateId !== this.settings.lastUpdateId) {
@@ -732,6 +766,291 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     this.settings.lastUpdateId = latestUpdateId;
     await this.saveSettings();
     new Notice(`Telegram chat ID set to ${resolvedChatId}`);
+  }
+
+  private async resolveLatestDailyNoteFile(): Promise<TFile | null> {
+    const rawSettings = dailyNotesApi.getDailyNoteSettings?.() ?? null;
+    const settings =
+      this.normalizeDailyNoteSettings(rawSettings) ?? { format: "YYYY-MM-DD", folder: "" };
+    const overridePath = this.resolveOverrideDailyNotePath(settings);
+    if (overridePath) {
+      const ensured = await this.ensureDailyNoteFile(overridePath);
+      if (ensured) {
+        return ensured;
+      }
+      new Notice("Daily note path override could not be created.");
+      return null;
+    }
+    let allNotes: Record<string, TFile> | Map<string, TFile> | null = null;
+    try {
+      allNotes = dailyNotesApi.getAllDailyNotes?.() ?? null;
+    } catch (error) {
+      console.warn("Failed to read daily notes index", error);
+      new Notice("Failed to read daily notes index. Creating today's note.");
+    }
+    const files = this.extractDailyNoteFiles(allNotes)
+      .map((file) => this.normalizeDailyNoteFile(file))
+      .filter((file): file is TFile => !!file);
+    const latest = this.getLatestNoteByMtime(files);
+    if (latest) {
+      return latest;
+    }
+    if (dailyNotesApi.createDailyNote) {
+      try {
+        const created = await dailyNotesApi.createDailyNote(moment(), settings);
+        const normalized = this.normalizeDailyNoteFile(created);
+        if (normalized) {
+          return normalized;
+        }
+        new Notice("Daily note file could not be resolved. Using fallback daily note path.");
+      } catch (error) {
+        console.warn("Failed to create daily note", error);
+        new Notice("Failed to create daily note.");
+      }
+    }
+
+    if (!rawSettings) {
+      new Notice("Daily Notes plugin is not configured. Using fallback daily note path.");
+    } else if (!dailyNotesApi.createDailyNote) {
+      new Notice("Daily Notes plugin is not available. Using fallback daily note path.");
+    }
+
+    const fallbackPath = this.buildDailyNotePath(settings, this.formatDailyNoteDate(settings));
+    const ensured = await this.ensureDailyNoteFile(fallbackPath);
+    if (!ensured) {
+      new Notice("Daily note file could not be created.");
+      return null;
+    }
+    return ensured;
+  }
+
+  private formatDailyNoteDate(settings: DailyNoteSettings): string {
+    const format = settings.format?.trim() ? settings.format.trim() : "YYYY-MM-DD";
+    const formatter = moment() as unknown as {
+      format?: (format: string) => string;
+      toDate?: () => Date;
+    };
+    if (typeof formatter.format === "function") {
+      return formatter.format(format);
+    }
+    const date = typeof formatter.toDate === "function" ? formatter.toDate() : new Date();
+    return this.formatDateWithPattern(date, format);
+  }
+
+  private formatDateWithPattern(date: Date, pattern: string): string {
+    const year = String(date.getFullYear()).padStart(4, "0");
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return pattern
+      .replace(/YYYY/g, year)
+      .replace(/MM/g, month)
+      .replace(/DD/g, day);
+  }
+
+  private buildDailyNotePath(settings: DailyNoteSettings, dateString: string): string {
+    const folder = settings.folder?.trim() ? settings.folder.trim().replace(/\/+$/, "") : "";
+    const name = dateString;
+    const filename = name.toLowerCase().endsWith(".md") ? name : `${name}.md`;
+    return folder ? `${folder}/${filename}` : filename;
+  }
+
+  private resolveOverrideDailyNotePath(settings: DailyNoteSettings): string | null {
+    const template = this.settings.dailyNotePathTemplate?.trim();
+    if (!template) {
+      return null;
+    }
+    const dateString = this.formatDailyNoteDate(settings);
+    let path = template.replace(/\{date\}/g, dateString).trim();
+    if (!path) {
+      return null;
+    }
+    const hasExtension = /\.[^/]+$/.test(path);
+    if (!hasExtension) {
+      path = `${path}.md`;
+    }
+    return path;
+  }
+
+  private async ensureDailyNoteFile(path: string): Promise<TFile | null> {
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) {
+      return existing;
+    }
+    const folderPath = path.split("/").slice(0, -1).join("/");
+    if (folderPath) {
+      const folder = this.app.vault.getAbstractFileByPath(folderPath);
+      if (!folder) {
+        try {
+          await this.app.vault.createFolder(folderPath);
+        } catch (error) {
+          console.warn("Failed to create daily note folder", error);
+          return null;
+        }
+      }
+    }
+    try {
+      return await this.app.vault.create(path, "");
+    } catch (error) {
+      console.warn("Failed to create daily note file", error);
+      return null;
+    }
+  }
+
+  private normalizeDailyNoteSettings(settings: DailyNoteSettings | null): DailyNoteSettings | null {
+    if (!settings) {
+      return null;
+    }
+    const format = typeof settings.format === "string" && settings.format.trim()
+      ? settings.format.trim()
+      : "YYYY-MM-DD";
+    const folder = typeof settings.folder === "string" ? settings.folder.trim() : undefined;
+    const template = typeof settings.template === "string" ? settings.template.trim() : undefined;
+    return { format, folder, template };
+  }
+
+  private extractDailyNoteFiles(
+    notes: Record<string, TFile> | Map<string, TFile> | null
+  ): TFile[] {
+    if (!notes) {
+      return [];
+    }
+    if (notes instanceof Map) {
+      return Array.from(notes.values());
+    }
+    return Object.values(notes);
+  }
+
+  private normalizeDailyNoteFile(candidate: unknown): TFile | null {
+    if (!candidate) {
+      return null;
+    }
+    if (candidate instanceof TFile) {
+      const resolved = this.app.vault.getAbstractFileByPath(candidate.path);
+      return resolved instanceof TFile ? resolved : null;
+    }
+    if (typeof candidate === "string" && candidate.trim()) {
+      const file = this.app.vault.getAbstractFileByPath(candidate.trim());
+      return file instanceof TFile ? file : null;
+    }
+    if (typeof candidate === "object") {
+      const path = (candidate as { path?: unknown }).path;
+      if (typeof path === "string" && path.trim()) {
+        const file = this.app.vault.getAbstractFileByPath(path.trim());
+        return file instanceof TFile ? file : null;
+      }
+    }
+    return null;
+  }
+
+  private getLatestNoteByMtime(files: TFile[]): TFile | null {
+    let latest: TFile | null = null;
+    let latestMtime = -1;
+    for (const file of files) {
+      const mtime = (file as { stat?: { mtime?: number } }).stat?.mtime ?? 0;
+      if (!latest || mtime > latestMtime) {
+        latest = file;
+        latestMtime = mtime;
+      }
+    }
+    return latest;
+  }
+
+  private async addTaskFromTelegram(messageText: string): Promise<void> {
+    try {
+      if (typeof messageText !== "string") {
+        new Notice("Telegram message is invalid; cannot add task.");
+        return;
+      }
+      const trimmedMessage = messageText.trim();
+      if (!trimmedMessage) {
+        new Notice("Telegram message is empty; cannot add task.");
+        return;
+      }
+
+      const { lineText: baseLineText, cleanedText } = buildTaskLineFromInput(trimmedMessage);
+      let lineText = baseLineText;
+      const globalTag = normalizeTagFilter(this.settings.globalFilterTag);
+      if (globalTag) {
+        const matcher = buildTagMatchRegex(globalTag);
+        if (!matcher || !matcher.test(lineText)) {
+          const prefixMatch = lineText.match(/^(\s*-\s*\[ \]\s*)(.*)$/);
+          if (prefixMatch) {
+            lineText = `${prefixMatch[1]}${globalTag} ${prefixMatch[2]}`.trimEnd();
+          } else {
+            lineText = `${globalTag} ${lineText}`.trim();
+          }
+        }
+      }
+      const dailyNote = await this.resolveLatestDailyNoteFile();
+      if (!dailyNote || !dailyNote.path) {
+        const message = "Daily note file not found; cannot add task.";
+        new Notice(message);
+        await this.safeTelegramCall("send message", () =>
+          this.telegramClient.sendMessage(message)
+        );
+        return;
+      }
+
+      const contents = await this.app.vault.read(dailyNote);
+      const lines = contents ? contents.split("\n") : [];
+      if (lines.length > 0 && lines[lines.length - 1] === "") {
+        lines.pop();
+      }
+
+      const lineIndex = lines.length;
+      const id = hashTaskId(`${dailyNote.path}::${lineIndex}::${lineText}`);
+      let finalLine = lineText;
+      if (this.settings.taskIdTaggingMode === "always") {
+        finalLine = ensureTaskIdTagOnLine(finalLine, id);
+      }
+
+      lines.push(finalLine);
+      await this.app.vault.modify(dailyNote, lines.join("\n"));
+
+      const shortId = id.slice(0, 8);
+      await this.safeTelegramCall("send message", () =>
+        this.telegramClient.sendMessage(`Added task: ${cleanedText} #${shortId}`)
+      );
+    } catch (error) {
+      const reason = error instanceof Error && error.message ? `: ${error.message}` : ".";
+      const location = this.describeErrorLocation(error);
+      const locationSuffix = location ? ` (${location})` : "";
+      new Notice(`Failed to add task from Telegram${reason}${locationSuffix}`);
+
+      const stack = error instanceof Error && error.stack ? error.stack : "";
+      const header = `Failed to add task from Telegram${reason}`;
+      const details = [
+        location ? `Location: ${location}` : null,
+        stack ? `Stack:\n${stack}` : null
+      ]
+        .filter(Boolean)
+        .join("\n");
+      let message = details ? `${header}\n${details}` : header;
+      if (message.length > TELEGRAM_SAFE_MESSAGE_LENGTH) {
+        message = `${message.slice(0, TELEGRAM_SAFE_MESSAGE_LENGTH - 3)}...`;
+      }
+
+      await this.safeTelegramCall("send message", () =>
+        this.telegramClient.sendMessage(message)
+      );
+    }
+  }
+
+  private describeErrorLocation(error: unknown): string | null {
+    if (!(error instanceof Error)) {
+      return null;
+    }
+    const stack = error.stack;
+    if (!stack) {
+      return null;
+    }
+    const lines = stack.split("\n");
+    if (lines.length < 2) {
+      return null;
+    }
+    const frame = lines.find((line, index) => index > 0 && line.trim().startsWith("at ")) ?? lines[1];
+    const match = frame.match(/\(?([^()]+\.(?:ts|js)(?::\d+){1,2})\)?/);
+    return match?.[1] ?? null;
   }
 
   private async completeTaskById(taskId: string): Promise<boolean> {
@@ -858,6 +1177,19 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.globalFilterTag)
           .onChange(async (value) => {
             this.plugin.settings.globalFilterTag = value.trim();
+            await this.plugin.saveSettingsAndReconfigure();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Daily note path override")
+      .setDesc("Optional file path for incoming Telegram tasks. Use {date} to insert the daily note date.")
+      .addText((text) =>
+        text
+          .setPlaceholder("Daily/{date}.md")
+          .setValue(this.plugin.settings.dailyNotePathTemplate)
+          .onChange(async (value) => {
+            this.plugin.settings.dailyNotePathTemplate = value.trim();
             await this.plugin.saveSettingsAndReconfigure();
           })
       );

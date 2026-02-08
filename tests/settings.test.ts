@@ -15,5 +15,6 @@ describe("settings", () => {
   it("has default settings values", () => {
     expect(DEFAULT_SETTINGS.tasksQuery).toBe("not done");
     expect(DEFAULT_SETTINGS.taskIdTaggingMode).toBe("always");
+    expect(DEFAULT_SETTINGS.dailyNotePathTemplate).toBe("");
   });
 });

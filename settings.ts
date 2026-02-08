@@ -5,6 +5,7 @@ export interface TelegramTasksNotifierSettings {
   chatId: string;
   tasksQuery: string;
   globalFilterTag: string;
+  dailyNotePathTemplate: string;
   notifyOnStartup: boolean;
   notificationIntervalMinutes: number;
   pollIntervalSeconds: number;
@@ -21,6 +22,7 @@ export const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
   chatId: "",
   tasksQuery: "not done",
   globalFilterTag: "",
+  dailyNotePathTemplate: "",
   notifyOnStartup: true,
   notificationIntervalMinutes: 60,
   pollIntervalSeconds: 10,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   buildTagMatchRegex,
+  buildTaskLineFromInput,
   formatTaskTextForMessage,
   getTaskDueTimestamp,
   getTaskPriority,
@@ -78,6 +79,12 @@ describe("tasks utilities", () => {
   it("derives task priority and due timestamps", () => {
     expect(getTaskPriority({ priority: "high" })).toBe(3);
     expect(getTaskDueTimestamp({ dueDate: "2024-05-06" })) .toBe(Date.UTC(2024, 4, 6));
+  });
+
+  it("builds a task line from input text", () => {
+    const parsed = buildTaskLineFromInput("Buy milk due:2024-12-31 priority: high");
+    expect(parsed.cleanedText).toBe("Buy milk");
+    expect(parsed.lineText).toBe("- [ ] Buy milk \uD83D\uDD3C \uD83D\uDCC5 2024-12-31");
   });
 
   it("matches global tags from task metadata or raw", () => {

@@ -421,6 +421,89 @@ export const parseDueFromRaw = (raw: string | null): number | null => {
   return null;
 };
 
+const extractDueDateStringFromInput = (input: string): string | null => {
+  const dueMatch = input.match(/(?:\b(?:due|date)\s*[:=]?\s*|\uD83D\uDCC5\s*)(\d{4}-\d{2}-\d{2})/i);
+  if (!dueMatch) {
+    return null;
+  }
+  return parseDateString(dueMatch[1]) !== null ? dueMatch[1] : null;
+};
+
+const extractPriorityFromInput = (input: string): number | null => {
+  const fromRaw = parsePriorityFromRaw(input);
+  if (fromRaw !== null) {
+    return fromRaw;
+  }
+  const pMatch = input.match(/\bp([0-4])\b/i);
+  if (pMatch) {
+    return Number.parseInt(pMatch[1], 10);
+  }
+  const numericMatch = input.match(/\bpriority\s*[:=]?\s*([0-4])\b/i);
+  if (numericMatch) {
+    return Number.parseInt(numericMatch[1], 10);
+  }
+  return null;
+};
+
+const priorityToEmoji = (priority: number | null): string | null => {
+  if (priority === null) {
+    return null;
+  }
+  if (priority >= 4) {
+    return "\u23EB";
+  }
+  if (priority === 3) {
+    return "\uD83D\uDD3C";
+  }
+  if (priority === 1) {
+    return "\uD83D\uDD3D";
+  }
+  if (priority <= 0) {
+    return "\u23EC";
+  }
+  return null;
+};
+
+export const buildTaskLineFromInput = (input: string): {
+  lineText: string;
+  cleanedText: string;
+  dueDate: string | null;
+  priority: number | null;
+} => {
+  let cleaned = input.trim();
+  cleaned = cleaned.replace(/^\s*-\s*\[[ xX]\]\s*/, "");
+
+  const dueDate = extractDueDateStringFromInput(cleaned);
+  const priority = extractPriorityFromInput(cleaned);
+
+  const duePattern = /(?:\b(?:due|date)\s*[:=]?\s*|\uD83D\uDCC5\s*)(\d{4}-\d{2}-\d{2})/gi;
+  const priorityPattern =
+    /\bpriority\s*[:=]?\s*(highest|urgent|top|high|medium|normal|default|low|lowest|none|p[0-4]|[0-4])\b/gi;
+
+  cleaned = cleaned
+    .replace(duePattern, " ")
+    .replace(priorityPattern, " ")
+    .replace(/\bp[0-4]\b/gi, " ")
+    .replace(/[\u23EB\u23EC\uD83D\uDD3C\uD83D\uDD3D]/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (!cleaned) {
+    cleaned = "(unnamed task)";
+  }
+
+  let lineText = `- [ ] ${cleaned}`;
+  const priorityEmoji = priorityToEmoji(priority);
+  if (priorityEmoji) {
+    lineText += ` ${priorityEmoji}`;
+  }
+  if (dueDate) {
+    lineText += ` \uD83D\uDCC5 ${dueDate}`;
+  }
+
+  return { lineText, cleanedText: cleaned, dueDate, priority };
+};
+
 export const getTaskDueTimestamp = (task: TaskLike): number | null => {
   const candidates = [
     task.dueDate,

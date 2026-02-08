@@ -10,9 +10,11 @@ class Notice {
 
 class TFile {
   path: string;
+  stat: { mtime: number };
 
   constructor(path: string = "") {
     this.path = path;
+    this.stat = { mtime: Date.now() };
   }
 }
 
@@ -101,4 +103,12 @@ const requestUrl = createRequestUrlMock();
 
 class App {}
 
-export { App, Notice, Plugin, PluginSettingTab, Setting, TFile, requestUrl };
+const moment = (input?: string | Date) => {
+  const date = input instanceof Date ? input : input ? new Date(input) : new Date();
+  return {
+    toDate: () => date,
+    valueOf: () => date.valueOf()
+  };
+};
+
+export { App, Notice, Plugin, PluginSettingTab, Setting, TFile, moment, requestUrl };
