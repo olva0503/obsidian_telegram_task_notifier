@@ -33,5 +33,6 @@ describe("settings", () => {
     expect(DEFAULT_SETTINGS.taskIdTaggingMode).toBe("always");
     expect(DEFAULT_SETTINGS.dailyNotePathTemplate).toBe("");
     expect(DEFAULT_SETTINGS.hostChatId).toBe("");
+    expect(DEFAULT_SETTINGS.lastIntervalNotificationSentAt).toBe(0);
   });
 });

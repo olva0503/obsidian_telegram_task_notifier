@@ -17,6 +17,7 @@ export interface TelegramTasksNotifierSettings {
   lastUpdateId: number;
   allowedTelegramUserIds: number[];
   taskIdTaggingMode: TaskIdTaggingMode;
+  lastIntervalNotificationSentAt: number;
 }
 
 export const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
@@ -35,7 +36,8 @@ export const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
   enableTelegramPolling: true,
   lastUpdateId: 0,
   allowedTelegramUserIds: [],
-  taskIdTaggingMode: "always"
+  taskIdTaggingMode: "always",
+  lastIntervalNotificationSentAt: 0
 };
 
 export const parseAllowedUserIds = (value: string): number[] => {

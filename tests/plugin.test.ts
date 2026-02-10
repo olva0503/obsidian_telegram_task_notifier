@@ -107,6 +107,99 @@ describe("TelegramTasksNotifierPlugin", () => {
     expect(keyboard?.[1]?.[0]?.text).toBe("List");
   });
 
+  it("sends updated list after completing a task via callback", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one\n- [ ] Task two"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0
+    };
+
+    const lineText = "- [ ] Task one";
+    const taskId = hashTaskId(`Notes.md::0::${lineText}`);
+    const sent: string[] = [];
+    const callbacks: string[] = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          callback_query: {
+            id: "cb-1",
+            data: `done:${taskId}`,
+            message: { chat: { id: 123 } },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async (_chatId: string | number, text: string) => {
+        sent.push(text);
+      },
+      answerCallbackQuery: async (_id: string, text?: string) => {
+        if (text) {
+          callbacks.push(text);
+        }
+      }
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain("Unfinished tasks: 1");
+    expect(sent[0]).toContain("Task two");
+    expect(sent[0]).not.toContain("Task one");
+    expect(callbacks[0]).toBe("Task marked complete");
+  });
+
+  it("sends done message when callback task is missing", async () => {
+    const app = createApp({});
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0
+    };
+
+    const sent: string[] = [];
+    const callbacks: string[] = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          callback_query: {
+            id: "cb-2",
+            data: "done:deadbeef",
+            message: { chat: { id: 123 } },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async (_chatId: string | number, text: string) => {
+        sent.push(text);
+      },
+      answerCallbackQuery: async (_id: string, text?: string) => {
+        if (text) {
+          callbacks.push(text);
+        }
+      }
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(sent[0]).toBe("All tasks are done.");
+    expect(callbacks[0]).toBe("All tasks are done.");
+  });
+
   it("allows adding tasks from same chat id", async () => {
     const app = createApp({ "Notes.md": "" });
     const plugin = new (TelegramTasksNotifierPlugin as any)(app);
@@ -379,6 +472,86 @@ describe("TelegramTasksNotifierPlugin", () => {
 
     const stored = app.__store.get("2024-01-01.md");
     expect(stored?.contents).toContain("- [ ] #shared Buy milk");
+  });
+
+  it("skips interval notification when interval has not elapsed", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      notificationIntervalMinutes: 60,
+      taskIdTaggingMode: "never",
+      lastIntervalNotificationSentAt: Date.now()
+    };
+
+    const sent: string[] = [];
+    (plugin as any).telegramClient = {
+      sendMessageTo: async (_chatId: string | number, text: string) => {
+        sent.push(text);
+      }
+    };
+
+    await (plugin as any).sendIntervalNotificationIfDue();
+
+    expect(sent).toEqual([]);
+  });
+
+  it("sends interval notification once elapsed and stores timestamp", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    const before = Date.now() - 61 * 60 * 1000;
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      notificationIntervalMinutes: 60,
+      taskIdTaggingMode: "never",
+      lastIntervalNotificationSentAt: before
+    };
+
+    const sent: string[] = [];
+    (plugin as any).telegramClient = {
+      sendMessageTo: async (_chatId: string | number, text: string) => {
+        sent.push(text);
+      }
+    };
+
+    await (plugin as any).sendIntervalNotificationIfDue();
+
+    expect(sent.length).toBe(1);
+    expect(plugin.settings.lastIntervalNotificationSentAt).toBeGreaterThan(before);
+  });
+
+  it("does not store interval timestamp when send fails", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    const before = Date.now() - 61 * 60 * 1000;
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      notificationIntervalMinutes: 60,
+      taskIdTaggingMode: "never",
+      lastIntervalNotificationSentAt: before
+    };
+
+    (plugin as any).telegramClient = {
+      sendMessageTo: async () => {
+        throw new Error("network down");
+      }
+    };
+
+    await (plugin as any).sendIntervalNotificationIfDue();
+
+    expect(plugin.settings.lastIntervalNotificationSentAt).toBe(before);
   });
 
   it("prevents guests from completing non-shared tasks", async () => {
