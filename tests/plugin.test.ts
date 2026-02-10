@@ -72,7 +72,7 @@ describe("TelegramTasksNotifierPlugin", () => {
     plugin.settings = {
       ...DEFAULT_SETTINGS,
       botToken: "token",
-      chatId: "123",
+      hostChatId: "123",
       enableTelegramPolling: true,
       pollIntervalSeconds: 10,
       taskIdTaggingMode: "never",
@@ -91,7 +91,7 @@ describe("TelegramTasksNotifierPlugin", () => {
           }
         }
       ],
-      sendMessage: async (text: string, reply_markup?: unknown) => {
+      sendMessageTo: async (_chatId: string | number, text: string, reply_markup?: unknown) => {
         sent.push({ text, markup: reply_markup });
       },
       answerCallbackQuery: async () => {}
@@ -113,7 +113,7 @@ describe("TelegramTasksNotifierPlugin", () => {
     plugin.settings = {
       ...DEFAULT_SETTINGS,
       botToken: "token",
-      chatId: "123",
+      hostChatId: "123",
       enableTelegramPolling: true,
       pollIntervalSeconds: 10,
       allowedTelegramUserIds: [111],
@@ -136,7 +136,7 @@ describe("TelegramTasksNotifierPlugin", () => {
           }
         }
       ],
-      sendMessage: async () => {},
+      sendMessageTo: async () => {},
       answerCallbackQuery: async () => {}
     };
 
@@ -151,19 +151,19 @@ describe("TelegramTasksNotifierPlugin", () => {
     plugin.settings = {
       ...DEFAULT_SETTINGS,
       botToken: "token",
-      chatId: "123",
+      hostChatId: "123",
       globalFilterTag: "#work",
       taskIdTaggingMode: "always"
     };
 
     const sent: string[] = [];
     (plugin as any).telegramClient = {
-      sendMessage: async (text: string) => {
+      sendMessageTo: async (_chatId: string | number, text: string) => {
         sent.push(text);
       }
     };
 
-    await (plugin as any).addTaskFromTelegram("Buy milk");
+    await (plugin as any).addTaskFromTelegram("Buy milk", { role: "host", chatId: 123 });
 
     const lineText = "- [ ] #work Buy milk";
     const id = hashTaskId(`2024-01-01.md::0::${lineText}`);
@@ -182,15 +182,15 @@ describe("TelegramTasksNotifierPlugin", () => {
     plugin.settings = {
       ...DEFAULT_SETTINGS,
       botToken: "token",
-      chatId: "123",
+      hostChatId: "123",
       taskIdTaggingMode: "never"
     };
 
     (plugin as any).telegramClient = {
-      sendMessage: async () => {}
+      sendMessageTo: async () => {}
     };
 
-    await (plugin as any).addTaskFromTelegram("Buy milk");
+    await (plugin as any).addTaskFromTelegram("Buy milk", { role: "host", chatId: 123 });
 
     const stored = app.__store.get("2024-01-01.md");
     expect(stored?.contents).toContain("- [ ] Buy milk");
@@ -203,17 +203,17 @@ describe("TelegramTasksNotifierPlugin", () => {
     plugin.settings = {
       ...DEFAULT_SETTINGS,
       botToken: "token",
-      chatId: "123"
+      hostChatId: "123"
     };
 
     const sent: string[] = [];
     (plugin as any).telegramClient = {
-      sendMessage: async (text: string) => {
+      sendMessageTo: async (_chatId: string | number, text: string) => {
         sent.push(text);
       }
     };
 
-    await (plugin as any).addTaskFromTelegram("Buy milk");
+    await (plugin as any).addTaskFromTelegram("Buy milk", { role: "host", chatId: 123 });
 
     const createdEntries = Array.from(app.__store.entries()).filter(([, entry]) => !entry.isFolder);
     expect(createdEntries.length).toBe(1);
@@ -228,15 +228,15 @@ describe("TelegramTasksNotifierPlugin", () => {
     plugin.settings = {
       ...DEFAULT_SETTINGS,
       botToken: "token",
-      chatId: "123",
+      hostChatId: "123",
       dailyNotePathTemplate: "Inbox.md"
     };
 
     (plugin as any).telegramClient = {
-      sendMessage: async () => {}
+      sendMessageTo: async () => {}
     };
 
-    await (plugin as any).addTaskFromTelegram("Buy milk");
+    await (plugin as any).addTaskFromTelegram("Buy milk", { role: "host", chatId: 123 });
 
     const stored = app.__store.get("Inbox.md");
     expect(stored?.contents).toContain("- [ ] Buy milk");
@@ -285,6 +285,119 @@ describe("TelegramTasksNotifierPlugin", () => {
     const stored = app.__store.get("Notes.md");
     expect(stored?.contents).toContain("- [x] Ship release");
     expect(stored?.contents).toContain("#taskid/");
+  });
+
+  it("records requestor chat IDs from /start", async () => {
+    const app = createApp({ "Notes.md": "- [ ] Task one" });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      lastUpdateId: 0
+    };
+
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          message: {
+            text: "/start",
+            chat: { id: 777 },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async () => {},
+      answerCallbackQuery: async () => {}
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(plugin.settings.requestors).toEqual([777]);
+  });
+
+  it("filters guest task list to shared tasks", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one #shared\n- [ ] Task two"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      guestChatIds: [456],
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0
+    };
+
+    const sent: string[] = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          message: {
+            text: "/list",
+            chat: { id: 456 },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async (_chatId: string | number, text: string) => {
+        sent.push(text);
+      },
+      answerCallbackQuery: async () => {}
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain("Unfinished tasks: 1");
+    expect(sent[0]).toContain("Task one");
+    expect(sent[0]).not.toContain("#shared");
+    expect(sent[0]).not.toContain("Task two");
+  });
+
+  it("adds #shared tag for guest-added tasks", async () => {
+    const app = createApp({ "2024-01-01.md": "" });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      taskIdTaggingMode: "never"
+    };
+
+    (plugin as any).telegramClient = {
+      sendMessageTo: async () => {}
+    };
+
+    await (plugin as any).addTaskFromTelegram("Buy milk", { role: "guest", chatId: 456 });
+
+    const stored = app.__store.get("2024-01-01.md");
+    expect(stored?.contents).toContain("- [ ] #shared Buy milk");
+  });
+
+  it("prevents guests from completing non-shared tasks", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one\n- [ ] Task two #shared"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      taskIdTaggingMode: "never"
+    };
+
+    const tasks = await (plugin as any).collectTasksFromVault();
+    const nonShared = tasks.find((task: { text?: string }) => task.text === "Task one");
+    expect(nonShared).toBeTruthy();
+    const success = await (plugin as any).completeTaskById(nonShared.id, "guest");
+    expect(success).toBe(false);
+    const stored = app.__store.get("Notes.md");
+    expect(stored?.contents).toContain("- [ ] Task one");
   });
 
   it("normalizes Tasks API results", () => {

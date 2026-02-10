@@ -36,7 +36,11 @@ describe("tasks utilities", () => {
 
   it("formats task text by removing tag", () => {
     const matcher = buildTagMatchRegex("#work");
+    const sharedMatcher = buildTagMatchRegex("#shared");
     expect(formatTaskTextForMessage("finish report #work", matcher)).toBe("finish report");
+    expect(formatTaskTextForMessage("finish report #work #shared", matcher, [sharedMatcher])).toBe(
+      "finish report"
+    );
   });
 
   it("detects task line patterns", () => {

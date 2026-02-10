@@ -2,7 +2,9 @@ export type TaskIdTaggingMode = "always" | "on-complete" | "never";
 
 export interface TelegramTasksNotifierSettings {
   botToken: string;
-  chatId: string;
+  hostChatId: string;
+  guestChatIds: number[];
+  requestors: number[];
   tasksQuery: string;
   globalFilterTag: string;
   dailyNotePathTemplate: string;
@@ -19,7 +21,9 @@ export interface TelegramTasksNotifierSettings {
 
 export const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
   botToken: "",
-  chatId: "",
+  hostChatId: "",
+  guestChatIds: [],
+  requestors: [],
   tasksQuery: "not done",
   globalFilterTag: "",
   dailyNotePathTemplate: "",
@@ -46,5 +50,20 @@ export const parseAllowedUserIds = (value: string): number[] => {
 };
 
 export const formatAllowedUserIds = (ids: number[]): string => {
+  return ids.length > 0 ? ids.join(", ") : "";
+};
+
+export const parseChatIds = (value: string): number[] => {
+  if (!value.trim()) {
+    return [];
+  }
+  const parts = value.split(/[\s,]+/).map((entry) => entry.trim()).filter(Boolean);
+  const ids = parts
+    .map((entry) => Number.parseInt(entry, 10))
+    .filter((entry) => Number.isFinite(entry));
+  return Array.from(new Set(ids));
+};
+
+export const formatChatIds = (ids: number[]): string => {
   return ids.length > 0 ? ids.join(", ") : "";
 };

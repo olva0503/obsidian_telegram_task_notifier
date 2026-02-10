@@ -104,13 +104,28 @@ export const buildTagMatchRegex = (tag: string): RegExp | null => {
   return new RegExp(`(^|\\s)${escaped}(?=\\s|$|[.,;:!?])`, "i");
 };
 
-export const formatTaskTextForMessage = (text: string, matcher?: RegExp | null): string => {
+const stripTagMatchers = (text: string, matchers: Array<RegExp | null | undefined>): string => {
+  let cleaned = text;
+  for (const matcher of matchers) {
+    if (!matcher) {
+      continue;
+    }
+    cleaned = cleaned.replace(matcher, " ");
+  }
+  const normalized = cleaned.replace(/\s{2,}/g, " ").trim();
+  return normalized || text;
+};
+
+export const formatTaskTextForMessage = (
+  text: string,
+  matcher?: RegExp | null,
+  extraMatchers: Array<RegExp | null | undefined> = []
+): string => {
   const cleanedTaskId = stripTaskIdTag(text);
-  if (!matcher) {
+  if (!matcher && extraMatchers.length === 0) {
     return cleanedTaskId;
   }
-  const cleaned = cleanedTaskId.replace(matcher, " ").replace(/\s{2,}/g, " ").trim();
-  return cleaned || cleanedTaskId;
+  return stripTagMatchers(cleanedTaskId, [matcher, ...extraMatchers]);
 };
 
 export const taskMatchesGlobalTag = (

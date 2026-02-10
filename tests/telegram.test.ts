@@ -7,7 +7,7 @@ describe("TelegramClient", () => {
   const settings = {
     ...DEFAULT_SETTINGS,
     botToken: "token",
-    chatId: "123"
+    hostChatId: "123"
   };
 
   beforeEach(() => {

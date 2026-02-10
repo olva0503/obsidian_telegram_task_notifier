@@ -30,7 +30,9 @@ import {
 } from "./tasks";
 import {
   DEFAULT_SETTINGS,
+  formatChatIds,
   formatAllowedUserIds,
+  parseChatIds,
   parseAllowedUserIds,
   type TaskIdTaggingMode,
   type TelegramTasksNotifierSettings
@@ -92,14 +94,13 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     });
     this.addCommand({
       id: "detect-telegram-chat-id",
-      name: "Detect Telegram chat ID",
+      name: "Detect Telegram requestor chat ID",
       callback: async () => {
         await this.detectTelegramChatId();
       }
     });
 
     this.configureIntervals();
-    void this.maybeDetectTelegramChatId();
 
     if (this.settings.notifyOnStartup) {
       this.app.workspace.onLayoutReady(() => {
@@ -182,16 +183,6 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   async saveSettingsAndReconfigure(): Promise<void> {
     await this.saveSettings();
     this.configureIntervals();
-  }
-
-  async maybeDetectTelegramChatId(): Promise<void> {
-    if (!this.settings.botToken.trim()) {
-      return;
-    }
-    if (this.settings.chatId.trim()) {
-      return;
-    }
-    await this.detectTelegramChatId();
   }
 
   private getTasksApi(): TasksApi | null {
@@ -455,8 +446,29 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     tasks: TaskRecord[],
     options: { allowEmpty?: boolean } = {}
   ): Promise<void> {
-    if (!this.settings.botToken.trim() || !this.settings.chatId.trim()) {
-      new Notice("Telegram bot token or chat ID is missing.");
+    if (!this.settings.botToken.trim()) {
+      new Notice("Telegram bot token is missing.");
+      return;
+    }
+
+    const targets: Array<{ chatId: string | number; role: "host" | "guest" }> = [];
+    const seen = new Set<string>();
+    const hostChatId = this.getHostChatIdValue();
+    if (hostChatId) {
+      seen.add(String(hostChatId));
+      targets.push({ chatId: hostChatId, role: "host" });
+    }
+    for (const guestChatId of this.settings.guestChatIds) {
+      const key = String(guestChatId);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      targets.push({ chatId: guestChatId, role: "guest" });
+    }
+
+    if (targets.length === 0) {
+      new Notice("Telegram host or guest chat IDs are missing.");
       return;
     }
 
@@ -465,27 +477,53 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
     if (tasks.length === 0) {
       if (options.allowEmpty) {
-        await this.safeTelegramCall("send message", () =>
-          this.telegramClient.sendMessage("No unfinished tasks found.")
-        );
+        for (const target of targets) {
+          await this.safeTelegramCall("send message", () =>
+            this.telegramClient.sendMessageTo(target.chatId, "No unfinished tasks found.")
+          );
+        }
       } else {
         new Notice("No unfinished tasks found.");
       }
       return;
     }
 
+    for (const target of targets) {
+      await this.sendTasksNotificationToChat(tasks, target.chatId, target.role, options);
+    }
+  }
+
+  private async sendTasksNotificationToChat(
+    tasks: TaskRecord[],
+    chatId: string | number,
+    role: "host" | "guest",
+    options: { allowEmpty?: boolean } = {}
+  ): Promise<void> {
+    const scopedTasks = role === "guest" ? tasks.filter((task) => this.isSharedTask(task)) : tasks;
+    if (scopedTasks.length === 0) {
+      if (options.allowEmpty) {
+        await this.safeTelegramCall("send message", () =>
+          this.telegramClient.sendMessageTo(chatId, "No unfinished tasks found.")
+        );
+      } else if (role === "host") {
+        new Notice("No unfinished tasks found.");
+      }
+      return;
+    }
+
     const maxTasks = Math.max(1, this.settings.maxTasksPerNotification);
-    const shownTasks = tasks.slice(0, maxTasks);
+    const shownTasks = scopedTasks.slice(0, maxTasks);
     const tagMatcher = buildTagMatchRegex(this.settings.globalFilterTag);
-    const header = `Unfinished tasks: ${tasks.length}`;
+    const sharedMatcher = buildTagMatchRegex("#shared");
+    const header = `Unfinished tasks: ${scopedTasks.length}`;
     const lines = shownTasks.map((task) => {
       const location = this.settings.includeFilePath && task.path
         ? ` (${task.path}${task.line !== null ? ":" + (task.line + 1) : ""})`
         : "";
-      return `- ${formatTaskTextForMessage(task.text, tagMatcher)}${location} #${task.shortId}`;
+      return `- ${formatTaskTextForMessage(task.text, tagMatcher, [sharedMatcher])}${location} #${task.shortId}`;
     });
-    const footer = tasks.length > shownTasks.length
-      ? `...and ${tasks.length - shownTasks.length} more`
+    const footer = scopedTasks.length > shownTasks.length
+      ? `...and ${scopedTasks.length - shownTasks.length} more`
       : "";
 
     const messages = this.buildTelegramMessages(header, lines, footer);
@@ -513,7 +551,9 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     for (let i = 0; i < messages.length; i += 1) {
       const text = messages[i];
       const markup = i === 0 ? replyMarkup : undefined;
-      const sent = await this.safeTelegramCall("send message", () => this.telegramClient.sendMessage(text, markup));
+      const sent = await this.safeTelegramCall("send message", () =>
+        this.telegramClient.sendMessageTo(chatId, text, markup)
+      );
       if (!sent) {
         return;
       }
@@ -580,12 +620,74 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
-  private isAllowedChatId(chatId: number | undefined | null): boolean {
-    const configured = this.settings.chatId.trim();
-    if (!configured || chatId === undefined || chatId === null) {
+  private parseHostChatId(): number | null {
+    const configured = this.settings.hostChatId.trim();
+    if (!configured) {
+      return null;
+    }
+    const parsed = Number.parseInt(configured, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  private getHostChatIdValue(): string | null {
+    const configured = this.settings.hostChatId.trim();
+    if (!configured) {
+      return null;
+    }
+    const parsed = Number.parseInt(configured, 10);
+    if (!Number.isFinite(parsed)) {
+      return null;
+    }
+    return configured;
+  }
+
+  private isHostChatId(chatId: number | undefined | null): boolean {
+    const hostChatId = this.parseHostChatId();
+    if (hostChatId === null || chatId === undefined || chatId === null) {
       return false;
     }
-    return String(chatId) === configured;
+    return hostChatId === chatId;
+  }
+
+  private isGuestChatId(chatId: number | undefined | null): boolean {
+    if (chatId === undefined || chatId === null) {
+      return false;
+    }
+    return this.settings.guestChatIds.includes(chatId);
+  }
+
+  private getChatRole(chatId: number | undefined | null): "host" | "guest" | "unknown" {
+    if (this.isHostChatId(chatId)) {
+      return "host";
+    }
+    if (this.isGuestChatId(chatId)) {
+      return "guest";
+    }
+    return "unknown";
+  }
+
+  private isSharedTask(task: TaskRecord): boolean {
+    const matcher = buildTagMatchRegex("#shared");
+    if (!matcher) {
+      return false;
+    }
+    const raw = task.raw ?? "";
+    if (raw && matcher.test(raw)) {
+      return true;
+    }
+    const text = task.text ?? "";
+    return matcher.test(text);
+  }
+
+  private async addRequestorChatId(chatId: number): Promise<void> {
+    if (!Number.isFinite(chatId)) {
+      return;
+    }
+    if (this.settings.requestors.includes(chatId)) {
+      return;
+    }
+    this.settings.requestors = [...this.settings.requestors, chatId];
+    await this.saveSettings();
   }
 
   private isAllowedTelegramUser(userId: number | undefined | null): boolean {
@@ -600,14 +702,18 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   }
 
   private isAuthorizedUpdate(chatId: number | undefined | null, userId: number | undefined | null): boolean {
-    return this.isAllowedChatId(chatId) && this.isAllowedTelegramUser(userId);
+    const role = this.getChatRole(chatId);
+    if (role === "unknown") {
+      return false;
+    }
+    return this.isAllowedTelegramUser(userId);
   }
 
   private async pollTelegramUpdates(): Promise<void> {
     if (!this.settings.enableTelegramPolling) {
       return;
     }
-    if (!this.settings.botToken.trim() || !this.settings.chatId.trim()) {
+    if (!this.settings.botToken.trim()) {
       return;
     }
     if (this.pollingInFlight) {
@@ -634,8 +740,9 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         if (callback?.data === "list") {
           const callbackChatId = callback.message?.chat?.id;
           const callbackUserId = callback.from?.id;
+          const role = this.getChatRole(callbackChatId);
 
-          if (!this.isAuthorizedUpdate(callbackChatId, callbackUserId)) {
+          if (role === "unknown" || !this.isAuthorizedUpdate(callbackChatId, callbackUserId)) {
             await this.safeTelegramCall("answer callback query", () =>
               this.telegramClient.answerCallbackQuery(callback.id, "Unauthorized")
             );
@@ -643,7 +750,9 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           }
 
           const tasks = await this.collectTasks();
-          await this.sendTasksNotificationWithTasks(tasks, { allowEmpty: true });
+          if (callbackChatId !== undefined && callbackChatId !== null) {
+            await this.sendTasksNotificationToChat(tasks, callbackChatId, role, { allowEmpty: true });
+          }
           await this.safeTelegramCall("answer callback query", () =>
             this.telegramClient.answerCallbackQuery(callback.id, "Sent task list")
           );
@@ -654,15 +763,16 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           const taskId = callback.data.slice("done:".length);
           const callbackChatId = callback.message?.chat?.id;
           const callbackUserId = callback.from?.id;
+          const role = this.getChatRole(callbackChatId);
 
-          if (!this.isAuthorizedUpdate(callbackChatId, callbackUserId)) {
+          if (role === "unknown" || !this.isAuthorizedUpdate(callbackChatId, callbackUserId)) {
             await this.safeTelegramCall("answer callback query", () =>
               this.telegramClient.answerCallbackQuery(callback.id, "Unauthorized")
             );
             continue;
           }
 
-          const success = await this.completeTaskById(taskId);
+          const success = await this.completeTaskById(taskId, role);
           await this.safeTelegramCall("answer callback query", () =>
             this.telegramClient.answerCallbackQuery(
               callback.id,
@@ -676,10 +786,17 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         const chatId = update.message?.chat?.id;
         const userId = update.message?.from?.id;
         const isBot = update.message?.from?.is_bot;
-        if (!this.isAllowedChatId(chatId)) {
+        if (isBot) {
           continue;
         }
-        if (isBot) {
+
+        const startMatch = messageText.match(/^\s*\/start(?:@\S+)?\s*$/i);
+        if (startMatch && chatId !== undefined && chatId !== null) {
+          await this.addRequestorChatId(chatId);
+        }
+
+        const role = this.getChatRole(chatId);
+        if (role === "unknown") {
           continue;
         }
 
@@ -689,7 +806,9 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
             continue;
           }
           const tasks = await this.collectTasks();
-          await this.sendTasksNotificationWithTasks(tasks, { allowEmpty: true });
+          if (chatId !== undefined && chatId !== null) {
+            await this.sendTasksNotificationToChat(tasks, chatId, role, { allowEmpty: true });
+          }
           continue;
         }
 
@@ -698,7 +817,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           if (!this.isAllowedTelegramUser(userId)) {
             continue;
           }
-          await this.completeTaskById(doneMatch[1]);
+          await this.completeTaskById(doneMatch[1], role);
           continue;
         }
 
@@ -707,7 +826,9 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           continue;
         }
 
-        await this.addTaskFromTelegram(trimmedMessage);
+        if (chatId !== undefined && chatId !== null) {
+          await this.addTaskFromTelegram(trimmedMessage, { role, chatId });
+        }
       }
 
       if (latestUpdateId !== this.settings.lastUpdateId) {
@@ -762,10 +883,12 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       new Notice("No /start message found. Using latest chat ID from updates.");
     }
 
-    this.settings.chatId = String(resolvedChatId);
+    if (!this.settings.requestors.includes(resolvedChatId)) {
+      this.settings.requestors = [...this.settings.requestors, resolvedChatId];
+    }
     this.settings.lastUpdateId = latestUpdateId;
     await this.saveSettings();
-    new Notice(`Telegram chat ID set to ${resolvedChatId}`);
+    new Notice(`Recorded requestor chat ID ${resolvedChatId}`);
   }
 
   private async resolveLatestDailyNoteFile(): Promise<TFile | null> {
@@ -955,7 +1078,10 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return latest;
   }
 
-  private async addTaskFromTelegram(messageText: string): Promise<void> {
+  private async addTaskFromTelegram(
+    messageText: string,
+    options: { role: "host" | "guest"; chatId: number | string }
+  ): Promise<void> {
     try {
       if (typeof messageText !== "string") {
         new Notice("Telegram message is invalid; cannot add task.");
@@ -969,24 +1095,34 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
       const { lineText: baseLineText, cleanedText } = buildTaskLineFromInput(trimmedMessage);
       let lineText = baseLineText;
+      const tagsToApply = new Set<string>();
+      if (options.role === "guest") {
+        tagsToApply.add("#shared");
+      }
       const globalTag = normalizeTagFilter(this.settings.globalFilterTag);
       if (globalTag) {
-        const matcher = buildTagMatchRegex(globalTag);
-        if (!matcher || !matcher.test(lineText)) {
-          const prefixMatch = lineText.match(/^(\s*-\s*\[ \]\s*)(.*)$/);
-          if (prefixMatch) {
-            lineText = `${prefixMatch[1]}${globalTag} ${prefixMatch[2]}`.trimEnd();
-          } else {
-            lineText = `${globalTag} ${lineText}`.trim();
-          }
+        tagsToApply.add(globalTag);
+      }
+      const applyTag = (text: string, tag: string): string => {
+        const matcher = buildTagMatchRegex(tag);
+        if (matcher && matcher.test(text)) {
+          return text;
         }
+        const prefixMatch = text.match(/^(\s*-\s*\[ \]\s*)(.*)$/);
+        if (prefixMatch) {
+          return `${prefixMatch[1]}${tag} ${prefixMatch[2]}`.trimEnd();
+        }
+        return `${tag} ${text}`.trim();
+      };
+      for (const tag of tagsToApply) {
+        lineText = applyTag(lineText, tag);
       }
       const dailyNote = await this.resolveLatestDailyNoteFile();
       if (!dailyNote || !dailyNote.path) {
         const message = "Daily note file not found; cannot add task.";
         new Notice(message);
         await this.safeTelegramCall("send message", () =>
-          this.telegramClient.sendMessage(message)
+          this.telegramClient.sendMessageTo(options.chatId, message)
         );
         return;
       }
@@ -1009,7 +1145,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
       const shortId = id.slice(0, 8);
       await this.safeTelegramCall("send message", () =>
-        this.telegramClient.sendMessage(`Added task: ${cleanedText} #${shortId}`)
+        this.telegramClient.sendMessageTo(options.chatId, `Added task: ${cleanedText} #${shortId}`)
       );
     } catch (error) {
       const reason = error instanceof Error && error.message ? `: ${error.message}` : ".";
@@ -1031,7 +1167,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       }
 
       await this.safeTelegramCall("send message", () =>
-        this.telegramClient.sendMessage(message)
+        this.telegramClient.sendMessageTo(options.chatId, message)
       );
     }
   }
@@ -1053,11 +1189,14 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return match?.[1] ?? null;
   }
 
-  private async completeTaskById(taskId: string): Promise<boolean> {
+  private async completeTaskById(taskId: string, role: "host" | "guest"): Promise<boolean> {
     const cached = this.taskCache.get(taskId);
     const task = cached ?? (await this.findTaskById(taskId));
     if (!task) {
       new Notice(`Task not found for ID ${taskId}`);
+      return false;
+    }
+    if (role === "guest" && !this.isSharedTask(task)) {
       return false;
     }
     const updated = await this.markTaskComplete(task);
@@ -1203,20 +1342,45 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.botToken)
           .onChange(async (value) => {
             this.plugin.settings.botToken = value.trim();
+             await this.plugin.saveSettingsAndReconfigure();
+           })
+       );
+
+    new Setting(containerEl)
+      .setName("Host chat ID")
+      .setDesc("Chat ID for the host (full access).")
+      .addText((text) =>
+        text
+          .setPlaceholder("123456789")
+          .setValue(this.plugin.settings.hostChatId)
+          .onChange(async (value) => {
+            this.plugin.settings.hostChatId = value.trim();
             await this.plugin.saveSettingsAndReconfigure();
-            await this.plugin.maybeDetectTelegramChatId();
           })
       );
 
     new Setting(containerEl)
-      .setName("Telegram chat ID")
-      .setDesc("Chat ID where notifications are sent.")
+      .setName("Guest chat IDs")
+      .setDesc("Comma-separated chat IDs that can access #shared tasks.")
       .addText((text) =>
         text
-          .setPlaceholder("123456789")
-          .setValue(this.plugin.settings.chatId)
+          .setPlaceholder("123456789, 987654321")
+          .setValue(formatChatIds(this.plugin.settings.guestChatIds))
           .onChange(async (value) => {
-            this.plugin.settings.chatId = value.trim();
+            this.plugin.settings.guestChatIds = parseChatIds(value);
+            await this.plugin.saveSettingsAndReconfigure();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Requestors")
+      .setDesc("Chat IDs that sent /start (editable).")
+      .addText((text) =>
+        text
+          .setPlaceholder("123456789, 987654321")
+          .setValue(formatChatIds(this.plugin.settings.requestors))
+          .onChange(async (value) => {
+            this.plugin.settings.requestors = parseChatIds(value);
             await this.plugin.saveSettingsAndReconfigure();
           })
       );

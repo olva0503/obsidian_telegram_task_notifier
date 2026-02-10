@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { DEFAULT_SETTINGS, formatAllowedUserIds, parseAllowedUserIds } from "../settings";
+import {
+  DEFAULT_SETTINGS,
+  formatAllowedUserIds,
+  formatChatIds,
+  parseAllowedUserIds,
+  parseChatIds
+} from "../settings";
 
 describe("settings", () => {
   it("parses allowed user IDs from strings", () => {
@@ -12,9 +18,20 @@ describe("settings", () => {
     expect(formatAllowedUserIds([1, 2, 3])) .toBe("1, 2, 3");
   });
 
+  it("parses chat IDs from strings", () => {
+    expect(parseChatIds("")) .toEqual([]);
+    expect(parseChatIds("123, 456 123")) .toEqual([123, 456]);
+  });
+
+  it("formats chat IDs", () => {
+    expect(formatChatIds([])) .toBe("");
+    expect(formatChatIds([1, 2, 3])) .toBe("1, 2, 3");
+  });
+
   it("has default settings values", () => {
     expect(DEFAULT_SETTINGS.tasksQuery).toBe("not done");
     expect(DEFAULT_SETTINGS.taskIdTaggingMode).toBe("always");
     expect(DEFAULT_SETTINGS.dailyNotePathTemplate).toBe("");
+    expect(DEFAULT_SETTINGS.hostChatId).toBe("");
   });
 });

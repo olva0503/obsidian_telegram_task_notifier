@@ -31,8 +31,17 @@ export class TelegramClient {
   }
 
   async sendMessage(text: string, replyMarkup?: Record<string, unknown>): Promise<void> {
+    const chatId = this.getSettings().hostChatId.trim();
+    await this.sendMessageTo(chatId, text, replyMarkup);
+  }
+
+  async sendMessageTo(
+    chatId: string | number,
+    text: string,
+    replyMarkup?: Record<string, unknown>
+  ): Promise<void> {
     await this.requestResult<void>("/sendMessage", {
-      chat_id: this.getSettings().chatId.trim(),
+      chat_id: chatId,
       text,
       reply_markup: replyMarkup
     });
