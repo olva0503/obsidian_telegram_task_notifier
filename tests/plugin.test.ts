@@ -107,6 +107,96 @@ describe("TelegramTasksNotifierPlugin", () => {
     expect(keyboard?.[1]?.[0]?.text).toBe("List");
   });
 
+  it("responds to /help with shared tasks guidance for host", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0
+    };
+
+    const sent: string[] = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          message: {
+            text: "/help",
+            chat: { id: 123 },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async (_chatId: string | number, text: string) => {
+        sent.push(text);
+      },
+      answerCallbackQuery: async () => {}
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain("/list");
+    expect(sent[0]).toContain("done <id>");
+    expect(sent[0]).toContain("due:");
+    expect(sent[0]).toContain("priority");
+    expect(sent[0]).toContain("#recur/");
+    expect(sent[0]).toContain("Shared tasks (admin)");
+    expect(sent[0]).toContain("#shared");
+  });
+
+  it("responds to /help without shared tasks guidance for guest", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one #shared"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      guestChatIds: [456],
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0
+    };
+
+    const sent: string[] = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          message: {
+            text: "/help",
+            chat: { id: 456 },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async (_chatId: string | number, text: string) => {
+        sent.push(text);
+      },
+      answerCallbackQuery: async () => {}
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain("/list");
+    expect(sent[0]).toContain("done <id>");
+    expect(sent[0]).toContain("due:");
+    expect(sent[0]).toContain("priority");
+    expect(sent[0]).toContain("#recur/");
+    expect(sent[0]).not.toContain("Shared tasks (admin)");
+  });
+
   it("sends updated list after completing a task via callback", async () => {
     const app = createApp({
       "Notes.md": "- [ ] Task one\n- [ ] Task two"
@@ -380,6 +470,80 @@ describe("TelegramTasksNotifierPlugin", () => {
     expect(stored?.contents).toContain("#taskid/");
   });
 
+  it("stores recurring completion timestamp when marking task complete", async () => {
+    const line = "- [ ] Pay rent #recur/1mo";
+    const id = hashTaskId(`Notes.md::0::${line}`);
+    const app = createApp({ "Notes.md": line });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      taskIdTaggingMode: "never"
+    };
+
+    const now = 1710000000000;
+    const originalNow = Date.now;
+    Date.now = () => now;
+
+    try {
+      const record = {
+        id,
+        shortId: id.slice(0, 8),
+        text: "Pay rent #recur/1mo",
+        path: "Notes.md",
+        line: 0,
+        raw: line,
+        priority: 0,
+        dueTimestamp: null
+      };
+
+      const result = await (plugin as any).markTaskComplete(record);
+      expect(result).toBe(true);
+      const stored = app.__store.get("Notes.md");
+      expect(stored?.contents).toContain("- [x] Pay rent #recur/1mo");
+      expect(stored?.contents).toContain(`#recurdone/${now}`);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("reopens completed recurring tasks after interval", async () => {
+    const now = 1710000000000;
+    const completedAt = now - 2 * 60 * 60 * 1000;
+    const app = createApp({
+      "Notes.md": `- [x] Water plants #recur/1h #recurdone/${completedAt}`
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      taskIdTaggingMode: "never"
+    };
+
+    await (plugin as any).reopenRecurringTasksInVault(now);
+
+    const stored = app.__store.get("Notes.md");
+    expect(stored?.contents).toContain("- [ ] Water plants #recur/1h");
+    expect(stored?.contents).not.toContain("#recurdone/");
+  });
+
+  it("keeps completed recurring tasks done before interval", async () => {
+    const now = 1710000000000;
+    const completedAt = now - 30 * 60 * 1000;
+    const app = createApp({
+      "Notes.md": `- [x] Water plants #recur/1h #recurdone/${completedAt}`
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      taskIdTaggingMode: "never"
+    };
+
+    await (plugin as any).reopenRecurringTasksInVault(now);
+
+    const stored = app.__store.get("Notes.md");
+    expect(stored?.contents).toContain("- [x] Water plants #recur/1h");
+    expect(stored?.contents).toContain(`#recurdone/${completedAt}`);
+  });
+
   it("records requestor chat IDs from /start", async () => {
     const app = createApp({ "Notes.md": "- [ ] Task one" });
     const plugin = new (TelegramTasksNotifierPlugin as any)(app);
@@ -474,6 +638,87 @@ describe("TelegramTasksNotifierPlugin", () => {
     expect(stored?.contents).toContain("- [ ] #shared Buy milk");
   });
 
+  it("redistributes task list to all chats when a guest adds a shared task", async () => {
+    const app = createApp({ "2024-01-01.md": "" });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      guestChatIds: [456],
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0
+    };
+
+    const sent: Array<{ chatId: number | string; text: string }> = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          message: {
+            text: "Buy milk",
+            chat: { id: 456 },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async (chatId: number | string, text: string) => {
+        sent.push({ chatId, text });
+      },
+      answerCallbackQuery: async () => {}
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    const hostMessages = sent.filter((entry) => Number(entry.chatId) === 123).map((entry) => entry.text);
+    const guestMessages = sent.filter((entry) => Number(entry.chatId) === 456).map((entry) => entry.text);
+
+    expect(hostMessages.some((text) => text.includes("Unfinished tasks: 1") && text.includes("Buy milk"))).toBe(true);
+    expect(guestMessages.some((text) => text.startsWith("Added task: Buy milk #"))).toBe(true);
+    expect(guestMessages.some((text) => text.includes("Unfinished tasks: 1") && text.includes("Buy milk"))).toBe(true);
+  });
+
+  it("does not redistribute to all chats when host adds a non-shared task", async () => {
+    const app = createApp({ "2024-01-01.md": "" });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      guestChatIds: [456],
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0
+    };
+
+    const sent: Array<{ chatId: number | string; text: string }> = [];
+    (plugin as any).telegramClient = {
+      getUpdates: async () => [
+        {
+          update_id: 1,
+          message: {
+            text: "Buy milk",
+            chat: { id: 123 },
+            from: { id: 999 }
+          }
+        }
+      ],
+      sendMessageTo: async (chatId: number | string, text: string) => {
+        sent.push({ chatId, text });
+      },
+      answerCallbackQuery: async () => {}
+    };
+
+    await (plugin as any).pollTelegramUpdates();
+
+    expect(sent.length).toBe(1);
+    expect(Number(sent[0]?.chatId)).toBe(123);
+    expect(sent[0]?.text.startsWith("Added task: Buy milk #")).toBe(true);
+  });
+
   it("skips interval notification when interval has not elapsed", async () => {
     const app = createApp({
       "Notes.md": "- [ ] Task one"
@@ -552,6 +797,46 @@ describe("TelegramTasksNotifierPlugin", () => {
     await (plugin as any).sendIntervalNotificationIfDue();
 
     expect(plugin.settings.lastIntervalNotificationSentAt).toBe(before);
+  });
+
+  it("configures recurring sweep interval even when notifications are disabled", () => {
+    const app = createApp({
+      "Notes.md": "- [x] Water plants #recur/1h #recurdone/1710000000000"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      notificationIntervalMinutes: 0,
+      enableTelegramPolling: false
+    };
+
+    const windowRef = ((globalThis as unknown as { window?: typeof globalThis }).window ?? globalThis) as typeof globalThis;
+    const originalWindow = (globalThis as unknown as { window?: typeof globalThis }).window;
+    (globalThis as unknown as { window: typeof globalThis }).window = windowRef;
+
+    const originalSetInterval = windowRef.setInterval;
+    const originalClearInterval = windowRef.clearInterval;
+    const intervals: number[] = [];
+
+    windowRef.setInterval = ((callback: TimerHandler, timeout?: number) => {
+      void callback;
+      intervals.push(Number(timeout ?? 0));
+      return 1;
+    }) as typeof windowRef.setInterval;
+    windowRef.clearInterval = (() => {}) as typeof windowRef.clearInterval;
+
+    try {
+      (plugin as any).configureIntervals();
+      expect(intervals).toContain(60 * 1000);
+    } finally {
+      windowRef.setInterval = originalSetInterval;
+      windowRef.clearInterval = originalClearInterval;
+      if (originalWindow === undefined) {
+        delete (globalThis as unknown as { window?: typeof globalThis }).window;
+      } else {
+        (globalThis as unknown as { window: typeof globalThis }).window = originalWindow;
+      }
+    }
   });
 
   it("prevents guests from completing non-shared tasks", async () => {

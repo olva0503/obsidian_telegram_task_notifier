@@ -17,6 +17,13 @@ export type TaskRecord = {
   dueTimestamp: number | null;
 };
 
+export type RecurrenceUnit = "m" | "h" | "d" | "w" | "mo";
+
+export type RecurrenceSpec = {
+  value: number;
+  unit: RecurrenceUnit;
+};
+
 export type TaskLike = {
   description?: string;
   text?: string;
@@ -168,6 +175,10 @@ export const isTaskLine = (lineText: string): boolean => {
   return /^\s*-\s*\[[ xX]\]\s*/.test(lineText);
 };
 
+export const isCompletedTaskLine = (lineText: string): boolean => {
+  return /^\s*-\s*\[[xX]\]\s*/.test(lineText);
+};
+
 export const getUncheckedTaskText = (lineText: string): string | null => {
   const match = lineText.match(/^\s*-\s*\[ \]\s*(.*)$/);
   return match ? match[1] : null;
@@ -196,6 +207,129 @@ export const replaceCheckbox = (lineText: string): string | null => {
   }
   const updated = lineText.replace(/\[[^\]]\]/, "[x]");
   return updated === lineText ? null : updated;
+};
+
+export const uncheckCheckbox = (lineText: string): string | null => {
+  if (!/\[[^\]]\]/.test(lineText)) {
+    return null;
+  }
+  const updated = lineText.replace(/\[[^\]]\]/, "[ ]");
+  return updated === lineText ? null : updated;
+};
+
+const buildRecurTagRegex = (flags: "i" | "gi" = "i"): RegExp => {
+  return new RegExp(
+    "(^|\\s)#recur\\/(\\d+)(mo|months|month|[mhdw])(?=\\s|$|[.,;:!?])",
+    flags
+  );
+};
+
+const buildRecurDoneTagRegex = (flags: "i" | "gi" = "i"): RegExp => {
+  return new RegExp("(^|\\s)#recurdone\\/(\\d+)(?=\\s|$|[.,;:!?])", flags);
+};
+
+const normalizeRecurrenceUnit = (unit: string): RecurrenceUnit | null => {
+  const normalized = unit.trim().toLowerCase();
+  if (normalized === "m" || normalized === "h" || normalized === "d" || normalized === "w") {
+    return normalized;
+  }
+  if (normalized === "mo" || normalized === "month" || normalized === "months") {
+    return "mo";
+  }
+  return null;
+};
+
+export const parseRecurrenceFromRaw = (raw: string | null): RecurrenceSpec | null => {
+  if (!raw) {
+    return null;
+  }
+  const match = raw.match(buildRecurTagRegex("i"));
+  if (!match) {
+    return null;
+  }
+  const value = Number.parseInt(match[2], 10);
+  const unit = normalizeRecurrenceUnit(match[3]);
+  if (!Number.isFinite(value) || value <= 0 || !unit) {
+    return null;
+  }
+  return { value, unit };
+};
+
+export const getRecurringCompletedAt = (raw: string | null): number | null => {
+  if (!raw) {
+    return null;
+  }
+  const match = raw.match(buildRecurDoneTagRegex("i"));
+  if (!match) {
+    return null;
+  }
+  const timestamp = Number.parseInt(match[2], 10);
+  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : null;
+};
+
+const addCalendarMonths = (timestamp: number, months: number): number => {
+  const source = new Date(timestamp);
+  if (!Number.isFinite(source.getTime())) {
+    return timestamp;
+  }
+  const targetMonthIndex = source.getMonth() + months;
+  const yearDelta = Math.floor(targetMonthIndex / 12);
+  const targetYear = source.getFullYear() + yearDelta;
+  const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
+  const maxDayInMonth = new Date(targetYear, targetMonth + 1, 0).getDate();
+  const day = Math.min(source.getDate(), maxDayInMonth);
+  const target = new Date(
+    targetYear,
+    targetMonth,
+    day,
+    source.getHours(),
+    source.getMinutes(),
+    source.getSeconds(),
+    source.getMilliseconds()
+  );
+  return target.getTime();
+};
+
+export const getRecurrenceNextTimestamp = (
+  completedAt: number,
+  recurrence: RecurrenceSpec
+): number => {
+  if (recurrence.unit === "mo") {
+    return addCalendarMonths(completedAt, recurrence.value);
+  }
+  const multipliers: Record<Exclude<RecurrenceUnit, "mo">, number> = {
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+    d: 24 * 60 * 60 * 1000,
+    w: 7 * 24 * 60 * 60 * 1000
+  };
+  return completedAt + recurrence.value * multipliers[recurrence.unit];
+};
+
+export const isRecurringTaskDue = (
+  completedAt: number,
+  recurrence: RecurrenceSpec,
+  now: number = Date.now()
+): boolean => {
+  return now >= getRecurrenceNextTimestamp(completedAt, recurrence);
+};
+
+export const upsertRecurringCompletedTag = (lineText: string, completedAt: number): string => {
+  const token = `#recurdone/${Math.max(1, Math.floor(completedAt))}`;
+  const regex = buildRecurDoneTagRegex("i");
+  if (regex.test(lineText)) {
+    return lineText.replace(regex, (_match, prefix: string) => `${prefix}${token}`);
+  }
+  const suffix = lineText.endsWith(" ") ? "" : " ";
+  return `${lineText}${suffix}${token}`;
+};
+
+export const stripRecurringCompletedTag = (lineText: string): string => {
+  const stripped = lineText
+    .replace(buildRecurDoneTagRegex("gi"), " ")
+    .replace(/\s{2,}/g, " ")
+    .trimEnd();
+  return stripped || lineText;
 };
 
 export const isTaskCompleted = (task: TaskLike): boolean => {

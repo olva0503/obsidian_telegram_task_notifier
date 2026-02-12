@@ -70,11 +70,13 @@ Commands (Command Palette):
 
 In Telegram:
 
+- Send `/help` to see supported commands and task formats.
 - Tap `Done #<id>` to mark a task complete.
 - Send `done <id>` to mark a task complete manually.
 - Send any message to create a new task in the latest daily note.
   - Optional metadata: `due:YYYY-MM-DD` and `priority: high|medium|low|urgent` (or `p0`-`p4`).
   - Guests automatically tag new tasks with `#shared`.
+- Shared task guidance is shown in Telegram help only for the host chat.
 
 ## Development
 

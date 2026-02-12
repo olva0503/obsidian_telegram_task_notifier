@@ -12,19 +12,26 @@ import {
   ensureTaskIdTagOnLine,
   buildTaskLineFromInput,
   formatTaskTextForMessage,
+  getRecurringCompletedAt,
   getUncheckedTaskText,
   hasTaskIdTag,
+  isCompletedTaskLine,
+  isRecurringTaskDue,
   isTaskLine,
   isTaskCompleted,
   isTaskLike,
   matchesTaskLine,
   normalizeTasksQuery,
   normalizeTagFilter,
+  parseRecurrenceFromRaw,
   parseDueFromRaw,
   parsePriorityFromRaw,
   replaceCheckbox,
+  stripRecurringCompletedTag,
   taskMatchesGlobalTag,
   toTaskRecord,
+  uncheckCheckbox,
+  upsertRecurringCompletedTag,
   type TaskRecord,
   type TaskLike
 } from "./tasks";
@@ -66,12 +73,15 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   settings: TelegramTasksNotifierSettings;
   private telegramClient: TelegramClient;
   private notificationIntervalId: number | null = null;
+  private recurringSweepIntervalId: number | null = null;
   private pollingLoopPromise: Promise<void> | null = null;
   private pollingAbort = false;
   private pollingInFlight = false;
   private sendInFlight = false;
   private pollingErrorStreak = 0;
   private taskCache = new Map<string, TaskRecord>();
+  private recurringSweepInFlight = false;
+  private lastRecurringSweepAt = 0;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -102,6 +112,10 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
     this.configureIntervals();
 
+    this.app.workspace.onLayoutReady(() => {
+      void this.reopenRecurringTasksIfDue();
+    });
+
     if (this.settings.notifyOnStartup) {
       this.app.workspace.onLayoutReady(() => {
         void this.sendIntervalNotificationWithRetryIfDue();
@@ -116,6 +130,10 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   private configureIntervals(): void {
     this.clearIntervals();
 
+    this.recurringSweepIntervalId = window.setInterval(() => {
+      void this.reopenRecurringTasksIfDue();
+    }, 60 * 1000);
+
     if (this.settings.notificationIntervalMinutes > 0) {
       this.notificationIntervalId = window.setInterval(() => {
         void this.sendIntervalNotificationIfDue();
@@ -128,6 +146,10 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   }
 
   private clearIntervals(): void {
+    if (this.recurringSweepIntervalId !== null) {
+      window.clearInterval(this.recurringSweepIntervalId);
+      this.recurringSweepIntervalId = null;
+    }
     if (this.notificationIntervalId !== null) {
       window.clearInterval(this.notificationIntervalId);
       this.notificationIntervalId = null;
@@ -279,6 +301,8 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   }
 
   private async collectTasks(): Promise<TaskRecord[]> {
+    await this.reopenRecurringTasksIfDue();
+
     const api = this.getTasksApi();
     if (!api) {
       const tasks = await this.collectTasksFromVault();
@@ -431,6 +455,68 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         await this.app.vault.modify(file, lines.join("\n"));
       }
     }
+  }
+
+  private async reopenRecurringTasksIfDue(now: number = Date.now()): Promise<void> {
+    const sweepIntervalMs = 60 * 1000;
+    if (this.recurringSweepInFlight) {
+      return;
+    }
+    if (now - this.lastRecurringSweepAt < sweepIntervalMs) {
+      return;
+    }
+
+    this.recurringSweepInFlight = true;
+    try {
+      await this.reopenRecurringTasksInVault(now);
+      this.lastRecurringSweepAt = now;
+    } finally {
+      this.recurringSweepInFlight = false;
+    }
+  }
+
+  private async reopenRecurringTasksInVault(now: number): Promise<number> {
+    let reopenedTasks = 0;
+    const files = this.app.vault.getMarkdownFiles();
+
+    for (const file of files) {
+      const contents = await this.app.vault.read(file);
+      const lines = contents.split("\n");
+      let changed = false;
+
+      for (let i = 0; i < lines.length; i += 1) {
+        const lineText = lines[i];
+        if (!isCompletedTaskLine(lineText)) {
+          continue;
+        }
+        const recurrence = parseRecurrenceFromRaw(lineText);
+        if (!recurrence) {
+          continue;
+        }
+        const completedAt = getRecurringCompletedAt(lineText);
+        if (completedAt === null) {
+          lines[i] = upsertRecurringCompletedTag(lineText, now);
+          changed = true;
+          continue;
+        }
+        if (!isRecurringTaskDue(completedAt, recurrence, now)) {
+          continue;
+        }
+        const unchecked = uncheckCheckbox(lineText);
+        if (!unchecked) {
+          continue;
+        }
+        lines[i] = stripRecurringCompletedTag(unchecked);
+        changed = true;
+        reopenedTasks += 1;
+      }
+
+      if (changed) {
+        await this.app.vault.modify(file, lines.join("\n"));
+      }
+    }
+
+    return reopenedTasks;
   }
 
   private sortTasks(records: TaskRecord[]): TaskRecord[] {
@@ -728,6 +814,40 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     return matcher.test(text);
   }
 
+  private buildTelegramHelpMessage(role: "host" | "guest"): string {
+    const lines = [
+      "Telegram Tasks Notifier help",
+      "",
+      "Commands:",
+      "- /list - send the current task list",
+      "- done <id> - mark a task as complete",
+      "- /help - show this help",
+      "",
+      "Create tasks by sending a normal message:",
+      "- Buy milk",
+      "",
+      "Task types and examples:",
+      "- With due date: Buy milk due:2026-02-14",
+      "- With date alias: Buy milk date:2026-02-14",
+      "- With priority: Prepare slides priority: high",
+      "- With short priority: Prepare slides p3",
+      "- Recurring: Water plants #recur/1d",
+      "",
+      "You can combine options in one task message."
+    ];
+
+    if (role === "host") {
+      lines.push(
+        "",
+        "Shared tasks (admin):",
+        "- Add #shared to make a task visible to guest chats",
+        "- Tasks added by guests are tagged #shared automatically"
+      );
+    }
+
+    return lines.join("\n");
+  }
+
   private async addRequestorChatId(chatId: number): Promise<void> {
     if (!Number.isFinite(chatId)) {
       return;
@@ -890,6 +1010,19 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           continue;
         }
 
+        const helpMatch = messageText.match(/^\s*\/help(?:@\S+)?\s*$/i);
+        if (helpMatch) {
+          if (!this.isAllowedTelegramUser(userId)) {
+            continue;
+          }
+          if (chatId !== undefined && chatId !== null) {
+            await this.safeTelegramCall("send message", () =>
+              this.telegramClient.sendMessageTo(chatId, this.buildTelegramHelpMessage(role))
+            );
+          }
+          continue;
+        }
+
         const doneMatch = messageText.match(/^\s*done\s+([a-f0-9]+)\s*$/i);
         if (doneMatch) {
           if (!this.isAllowedTelegramUser(userId)) {
@@ -929,7 +1062,11 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         }
 
         if (chatId !== undefined && chatId !== null) {
-          await this.addTaskFromTelegram(trimmedMessage, { role, chatId });
+          const addedTask = await this.addTaskFromTelegram(trimmedMessage, { role, chatId });
+          if (addedTask?.added && addedTask.isShared) {
+            const tasks = await this.collectTasks();
+            await this.sendTasksNotificationWithTasks(tasks);
+          }
         }
       }
 
@@ -1183,16 +1320,16 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   private async addTaskFromTelegram(
     messageText: string,
     options: { role: "host" | "guest"; chatId: number | string }
-  ): Promise<void> {
+  ): Promise<{ added: boolean; isShared: boolean }> {
     try {
       if (typeof messageText !== "string") {
         new Notice("Telegram message is invalid; cannot add task.");
-        return;
+        return { added: false, isShared: false };
       }
       const trimmedMessage = messageText.trim();
       if (!trimmedMessage) {
         new Notice("Telegram message is empty; cannot add task.");
-        return;
+        return { added: false, isShared: false };
       }
 
       const { lineText: baseLineText, cleanedText } = buildTaskLineFromInput(trimmedMessage);
@@ -1226,7 +1363,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         await this.safeTelegramCall("send message", () =>
           this.telegramClient.sendMessageTo(options.chatId, message)
         );
-        return;
+        return { added: false, isShared: false };
       }
 
       const contents = await this.app.vault.read(dailyNote);
@@ -1246,9 +1383,20 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       await this.app.vault.modify(dailyNote, lines.join("\n"));
 
       const shortId = id.slice(0, 8);
+      const isShared = this.isSharedTask({
+        id,
+        shortId,
+        text: cleanedText,
+        path: dailyNote.path,
+        line: lineIndex,
+        raw: finalLine,
+        priority: 0,
+        dueTimestamp: null
+      });
       await this.safeTelegramCall("send message", () =>
         this.telegramClient.sendMessageTo(options.chatId, `Added task: ${cleanedText} #${shortId}`)
       );
+      return { added: true, isShared };
     } catch (error) {
       const reason = error instanceof Error && error.message ? `: ${error.message}` : ".";
       const location = this.describeErrorLocation(error);
@@ -1271,6 +1419,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       await this.safeTelegramCall("send message", () =>
         this.telegramClient.sendMessageTo(options.chatId, message)
       );
+      return { added: false, isShared: false };
     }
   }
 
@@ -1331,6 +1480,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     const lines = contents.split("\n");
     const shouldTag = this.settings.taskIdTaggingMode !== "never";
     const idTagRegex = buildTaskIdTagRegexForId(task.id, "i");
+    const completedAt = Date.now();
 
     const candidateIndexes: number[] = [];
     if (typeof task.line === "number") {
@@ -1346,9 +1496,12 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       }
       const updated = replaceCheckbox(lines[index]);
       if (updated) {
-        const nextLine = shouldTag && !hasTaskIdTag(updated)
+        const taggedLine = shouldTag && !hasTaskIdTag(updated)
           ? ensureTaskIdTagOnLine(updated, task.id)
           : updated;
+        const nextLine = parseRecurrenceFromRaw(taggedLine)
+          ? upsertRecurringCompletedTag(taggedLine, completedAt)
+          : stripRecurringCompletedTag(taggedLine);
         lines[index] = nextLine;
         await this.app.vault.modify(file, lines.join("\n"));
         return true;
@@ -1359,9 +1512,12 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       if (idTagRegex.test(lines[i]) && isTaskLine(lines[i])) {
         const updated = replaceCheckbox(lines[i]);
         if (updated) {
-          const nextLine = shouldTag && !hasTaskIdTag(updated)
+          const taggedLine = shouldTag && !hasTaskIdTag(updated)
             ? ensureTaskIdTagOnLine(updated, task.id)
             : updated;
+          const nextLine = parseRecurrenceFromRaw(taggedLine)
+            ? upsertRecurringCompletedTag(taggedLine, completedAt)
+            : stripRecurringCompletedTag(taggedLine);
           lines[i] = nextLine;
           await this.app.vault.modify(file, lines.join("\n"));
           return true;
@@ -1372,9 +1528,12 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       }
       const updated = replaceCheckbox(lines[i]);
       if (updated) {
-        const nextLine = shouldTag && !hasTaskIdTag(updated)
+        const taggedLine = shouldTag && !hasTaskIdTag(updated)
           ? ensureTaskIdTagOnLine(updated, task.id)
           : updated;
+        const nextLine = parseRecurrenceFromRaw(taggedLine)
+          ? upsertRecurringCompletedTag(taggedLine, completedAt)
+          : stripRecurringCompletedTag(taggedLine);
         lines[i] = nextLine;
         await this.app.vault.modify(file, lines.join("\n"));
         return true;

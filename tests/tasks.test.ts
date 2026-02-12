@@ -3,19 +3,27 @@ import {
   buildTagMatchRegex,
   buildTaskLineFromInput,
   formatTaskTextForMessage,
+  getRecurrenceNextTimestamp,
+  getRecurringCompletedAt,
   getTaskDueTimestamp,
   getTaskPriority,
   getTaskText,
+  isCompletedTaskLine,
+  isRecurringTaskDue,
   isTaskCompleted,
   isTaskLine,
   isUncheckedTaskLine,
   matchesTaskLine,
   normalizeTasksQuery,
+  parseRecurrenceFromRaw,
   parseDueFromRaw,
   parsePriorityFromRaw,
   replaceCheckbox,
+  stripRecurringCompletedTag,
   taskMatchesGlobalTag,
-  toTaskRecord
+  toTaskRecord,
+  uncheckCheckbox,
+  upsertRecurringCompletedTag
 } from "../tasks";
 
 describe("tasks utilities", () => {
@@ -52,6 +60,12 @@ describe("tasks utilities", () => {
   it("replaces checkbox when present", () => {
     expect(replaceCheckbox("- [ ] todo")).toBe("- [x] todo");
     expect(replaceCheckbox("no box")).toBeNull();
+    expect(uncheckCheckbox("- [x] todo")).toBe("- [ ] todo");
+  });
+
+  it("detects completed task lines", () => {
+    expect(isCompletedTaskLine("- [x] done")).toBe(true);
+    expect(isCompletedTaskLine("- [ ] open")).toBe(false);
   });
 
   it("matches task line content", () => {
@@ -129,5 +143,37 @@ describe("tasks utilities", () => {
   it("gets task text with fallback", () => {
     expect(getTaskText({ task: "hello" })).toBe("hello");
     expect(getTaskText({})) .toBe("(unnamed task)");
+  });
+
+  it("parses recurrence tags from raw text", () => {
+    expect(parseRecurrenceFromRaw("- [ ] Pay rent #recur/1mo")).toEqual({ value: 1, unit: "mo" });
+    expect(parseRecurrenceFromRaw("- [ ] Water plants #recur/2d")).toEqual({ value: 2, unit: "d" });
+    expect(parseRecurrenceFromRaw("- [ ] Invalid #recur/0d")).toBeNull();
+    expect(parseRecurrenceFromRaw("- [ ] Invalid #recur/3y")).toBeNull();
+  });
+
+  it("handles recurring completion tags", () => {
+    const tagged = upsertRecurringCompletedTag("- [x] Pay rent #recur/1mo", 1700000000000);
+    expect(tagged).toContain("#recurdone/1700000000000");
+    expect(getRecurringCompletedAt(tagged)).toBe(1700000000000);
+    const stripped = stripRecurringCompletedTag(tagged);
+    expect(stripped).not.toContain("#recurdone/");
+  });
+
+  it("computes next recurrence timestamp for calendar months", () => {
+    const completedAt = new Date(2024, 0, 31, 8, 30, 0, 0).getTime();
+    const next = getRecurrenceNextTimestamp(completedAt, { value: 1, unit: "mo" });
+    const date = new Date(next);
+    expect(date.getFullYear()).toBe(2024);
+    expect(date.getMonth()).toBe(1);
+    expect(date.getDate()).toBe(29);
+    expect(date.getHours()).toBe(8);
+    expect(date.getMinutes()).toBe(30);
+  });
+
+  it("determines whether recurring task is due", () => {
+    const completedAt = Date.UTC(2024, 0, 1, 0, 0, 0);
+    expect(isRecurringTaskDue(completedAt, { value: 1, unit: "d" }, completedAt + 24 * 60 * 60 * 1000)).toBe(true);
+    expect(isRecurringTaskDue(completedAt, { value: 1, unit: "d" }, completedAt + 23 * 60 * 60 * 1000)).toBe(false);
   });
 });
