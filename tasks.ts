@@ -15,11 +15,18 @@ export type TaskRecord = {
   raw: string | null;
   priority: number;
   dueTimestamp: number | null;
+  dueHasTime?: boolean;
+  reminders?: ReminderSpec[];
 };
 
 export type RecurrenceUnit = "m" | "h" | "d" | "w" | "mo";
 
 export type RecurrenceSpec = {
+  value: number;
+  unit: RecurrenceUnit;
+};
+
+export type ReminderSpec = {
   value: number;
   unit: RecurrenceUnit;
 };
@@ -253,6 +260,71 @@ export const parseRecurrenceFromRaw = (raw: string | null): RecurrenceSpec | nul
     return null;
   }
   return { value, unit };
+};
+
+export const parseRemindersFromRaw = (raw: string | null): ReminderSpec[] => {
+  if (!raw) {
+    return [];
+  }
+  const regex = new RegExp(
+    "(^|\\s)#remind\\/(\\d+)(mo|months|month|[mhdw])(?=\\s|$|[.,;:!?])",
+    "gi"
+  );
+  const reminders: ReminderSpec[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(raw)) !== null) {
+    const value = Number.parseInt(match[2], 10);
+    const unit = normalizeRecurrenceUnit(match[3]);
+    if (!Number.isFinite(value) || value <= 0 || !unit) {
+      continue;
+    }
+    reminders.push({ value, unit });
+  }
+  return reminders;
+};
+
+const dedupeReminderSpecs = (reminders: ReminderSpec[]): ReminderSpec[] => {
+  const seen = new Set<string>();
+  const unique: ReminderSpec[] = [];
+  for (const reminder of reminders) {
+    const key = `${reminder.value}:${reminder.unit}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(reminder);
+  }
+  return unique;
+};
+
+const parseRemindersFromTags = (tags: unknown): ReminderSpec[] => {
+  if (!Array.isArray(tags)) {
+    return [];
+  }
+  const candidates: string[] = [];
+  for (const tag of tags) {
+    if (typeof tag === "string") {
+      candidates.push(tag);
+      continue;
+    }
+    if (!tag || typeof tag !== "object") {
+      continue;
+    }
+    const record = tag as { tag?: unknown; value?: unknown; name?: unknown; text?: unknown; label?: unknown };
+    const token = [record.tag, record.value, record.name, record.text, record.label].find(
+      (entry) => typeof entry === "string" && entry.trim().length > 0
+    );
+    if (typeof token === "string") {
+      candidates.push(token);
+    }
+  }
+
+  const reminders: ReminderSpec[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.startsWith("#") ? candidate : `#${candidate}`;
+    reminders.push(...parseRemindersFromRaw(` ${normalized} `));
+  }
+  return dedupeReminderSpecs(reminders);
 };
 
 export const getRecurringCompletedAt = (raw: string | null): number | null => {
@@ -493,18 +565,47 @@ export const getTaskPriority = (task: TaskLike): number => {
   return fromRaw ?? 0;
 };
 
-const parseDateString = (value: string): number | null => {
+const parseDateStringDetailed = (value: string): { timestamp: number; hasTime: boolean } | null => {
+  const dateTimeMatch = value.match(/\b(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?\b/);
+  if (dateTimeMatch) {
+    const year = Number.parseInt(dateTimeMatch[1], 10);
+    const month = Number.parseInt(dateTimeMatch[2], 10);
+    const day = Number.parseInt(dateTimeMatch[3], 10);
+    const hour = Number.parseInt(dateTimeMatch[4], 10);
+    const minute = Number.parseInt(dateTimeMatch[5], 10);
+    const second = Number.parseInt(dateTimeMatch[6] ?? "0", 10);
+    if (
+      Number.isFinite(year) &&
+      Number.isFinite(month) &&
+      Number.isFinite(day) &&
+      Number.isFinite(hour) &&
+      Number.isFinite(minute) &&
+      Number.isFinite(second)
+    ) {
+      const timestamp = new Date(year, month - 1, day, hour, minute, second).getTime();
+      return { timestamp, hasTime: true };
+    }
+  }
   const isoMatch = value.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   if (isoMatch) {
     const year = Number.parseInt(isoMatch[1], 10);
     const month = Number.parseInt(isoMatch[2], 10);
     const day = Number.parseInt(isoMatch[3], 10);
     if (Number.isFinite(year) && Number.isFinite(month) && Number.isFinite(day)) {
-      return Date.UTC(year, month - 1, day);
+      return { timestamp: Date.UTC(year, month - 1, day), hasTime: false };
     }
   }
   const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  const hasTime = /[T\s]\d{2}:\d{2}/.test(value);
+  return { timestamp: parsed, hasTime };
+};
+
+const parseDateString = (value: string): number | null => {
+  const parsed = parseDateStringDetailed(value);
+  return parsed ? parsed.timestamp : null;
 };
 
 const normalizeDueTimestamp = (value: unknown): number | null => {
@@ -555,27 +656,110 @@ const normalizeDueTimestamp = (value: unknown): number | null => {
   return null;
 };
 
-export const parseDueFromRaw = (raw: string | null): number | null => {
-  if (!raw) {
+const normalizeDueInfo = (value: unknown): { timestamp: number; hasTime: boolean } | null => {
+  if (value === null || value === undefined) {
     return null;
   }
-  const emojiMatch = raw.match(/\uD83D\uDCC5\s*(\d{4}-\d{2}-\d{2})/);
-  if (emojiMatch) {
-    return parseDateString(emojiMatch[1]);
+  if (value instanceof Date) {
+    return { timestamp: value.getTime(), hasTime: true };
   }
-  const dueMatch = raw.match(/\bdue[:\s]*([0-9]{4}-[0-9]{2}-[0-9]{2})\b/i);
-  if (dueMatch) {
-    return parseDateString(dueMatch[1]);
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return { timestamp: value > 1_000_000_000_000 ? value : value * 1000, hasTime: true };
+  }
+  if (typeof value === "string") {
+    return parseDateStringDetailed(value);
+  }
+  if (typeof value === "object") {
+    const record = value as {
+      toMillis?: () => number;
+      toJSDate?: () => Date;
+      toISO?: () => string;
+      year?: unknown;
+      month?: unknown;
+      day?: unknown;
+      hour?: unknown;
+      minute?: unknown;
+      second?: unknown;
+      date?: unknown;
+    };
+    if (typeof record.toMillis === "function") {
+      const millis = record.toMillis();
+      return Number.isFinite(millis) ? { timestamp: millis, hasTime: true } : null;
+    }
+    if (typeof record.toJSDate === "function") {
+      const date = record.toJSDate();
+      return date instanceof Date ? { timestamp: date.getTime(), hasTime: true } : null;
+    }
+    if (typeof record.toISO === "function") {
+      return parseDateStringDetailed(record.toISO());
+    }
+    if (
+      typeof record.year === "number" &&
+      typeof record.month === "number" &&
+      typeof record.day === "number"
+    ) {
+      const timestamp = Date.UTC(
+        record.year,
+        record.month - 1,
+        record.day,
+        typeof record.hour === "number" ? record.hour : 0,
+        typeof record.minute === "number" ? record.minute : 0,
+        typeof record.second === "number" ? record.second : 0
+      );
+      const hasTime = typeof record.hour === "number" || typeof record.minute === "number";
+      return { timestamp, hasTime };
+    }
+    if (typeof record.date === "string") {
+      return parseDateStringDetailed(record.date);
+    }
   }
   return null;
 };
 
-const extractDueDateStringFromInput = (input: string): string | null => {
-  const dueMatch = input.match(/(?:\b(?:due|date)\s*[:=]?\s*|\uD83D\uDCC5\s*)(\d{4}-\d{2}-\d{2})/i);
+export const parseDueInfoFromRaw = (raw: string | null): { dueTimestamp: number | null; dueHasTime: boolean } => {
+  if (!raw) {
+    return { dueTimestamp: null, dueHasTime: false };
+  }
+  const emojiDateTimeMatch = raw.match(/\uD83D\uDCC5\s*(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2})?)/);
+  if (emojiDateTimeMatch) {
+    const parsed = parseDateStringDetailed(emojiDateTimeMatch[1]);
+    if (parsed) {
+      return { dueTimestamp: parsed.timestamp, dueHasTime: parsed.hasTime };
+    }
+  }
+  const emojiMatch = raw.match(/\uD83D\uDCC5\s*(\d{4}-\d{2}-\d{2})/);
+  if (emojiMatch) {
+    return { dueTimestamp: parseDateString(emojiMatch[1]), dueHasTime: false };
+  }
+  const dueDateTimeMatch = raw.match(/\bdue[:\s]*([0-9]{4}-[0-9]{2}-[0-9]{2}[T\s][0-9]{2}:[0-9]{2}(?::[0-9]{2})?)\b/i);
+  if (dueDateTimeMatch) {
+    const parsed = parseDateStringDetailed(dueDateTimeMatch[1]);
+    if (parsed) {
+      return { dueTimestamp: parsed.timestamp, dueHasTime: parsed.hasTime };
+    }
+  }
+  const dueMatch = raw.match(/\bdue[:\s]*([0-9]{4}-[0-9]{2}-[0-9]{2})\b/i);
+  if (dueMatch) {
+    return { dueTimestamp: parseDateString(dueMatch[1]), dueHasTime: false };
+  }
+  return { dueTimestamp: null, dueHasTime: false };
+};
+
+export const parseDueFromRaw = (raw: string | null): number | null => {
+  return parseDueInfoFromRaw(raw).dueTimestamp;
+};
+
+const extractDueStringFromInput = (input: string): string | null => {
+  const dueMatch = input.match(
+    /(?:\b(?:due|date)\s*[:=]?\s*|\uD83D\uDCC5\s*)(\d{4}-\d{2}-\d{2})(?:[T\s](\d{2}:\d{2})(?::\d{2})?)?/i
+  );
   if (!dueMatch) {
     return null;
   }
-  return parseDateString(dueMatch[1]) !== null ? dueMatch[1] : null;
+  const datePart = dueMatch[1];
+  const timePart = dueMatch[2];
+  const candidate = timePart ? `${datePart} ${timePart}` : datePart;
+  return parseDateStringDetailed(candidate) !== null ? candidate : null;
 };
 
 const extractPriorityFromInput = (input: string): number | null => {
@@ -622,10 +806,11 @@ export const buildTaskLineFromInput = (input: string): {
   let cleaned = input.trim();
   cleaned = cleaned.replace(/^\s*-\s*\[[ xX]\]\s*/, "");
 
-  const dueDate = extractDueDateStringFromInput(cleaned);
+  const dueDate = extractDueStringFromInput(cleaned);
   const priority = extractPriorityFromInput(cleaned);
 
-  const duePattern = /(?:\b(?:due|date)\s*[:=]?\s*|\uD83D\uDCC5\s*)(\d{4}-\d{2}-\d{2})/gi;
+  const duePattern =
+    /(?:\b(?:due|date)\s*[:=]?\s*|\uD83D\uDCC5\s*)(\d{4}-\d{2}-\d{2})(?:[T\s]\d{2}:\d{2}(?::\d{2})?)?/gi;
   const priorityPattern =
     /\bpriority\s*[:=]?\s*(highest|urgent|top|high|medium|normal|default|low|lowest|none|p[0-4]|[0-4])\b/gi;
 
@@ -672,13 +857,48 @@ export const getTaskDueTimestamp = (task: TaskLike): number | null => {
   return parseDueFromRaw(getTaskRaw(task));
 };
 
+export const getTaskDueInfo = (task: TaskLike): { dueTimestamp: number | null; dueHasTime: boolean } => {
+  const candidates = [
+    task.dueDate,
+    task.due,
+    task.dueOn,
+    task.dueDateTime,
+    task.dueAt,
+    task.dueDateString,
+    task.dates?.due
+  ];
+  let firstParsed: { timestamp: number; hasTime: boolean } | null = null;
+  for (const candidate of candidates) {
+    const normalized = normalizeDueInfo(candidate);
+    if (normalized !== null) {
+      if (normalized.hasTime) {
+        return { dueTimestamp: normalized.timestamp, dueHasTime: true };
+      }
+      if (firstParsed === null) {
+        firstParsed = normalized;
+      }
+    }
+  }
+  if (firstParsed !== null) {
+    return { dueTimestamp: firstParsed.timestamp, dueHasTime: false };
+  }
+  const raw = getTaskRaw(task);
+  return parseDueInfoFromRaw(raw);
+};
+
 export const toTaskRecord = (task: TaskLike): TaskRecord => {
   const text = getTaskText(task);
   const path = getTaskPath(task);
   const line = getTaskLine(task);
   const raw = getTaskRaw(task);
   const priority = getTaskPriority(task);
-  const dueTimestamp = getTaskDueTimestamp(task);
+  const dueInfo = getTaskDueInfo(task);
+  const dueTimestamp = dueInfo.dueTimestamp;
+  const reminders = dedupeReminderSpecs([
+    ...parseRemindersFromRaw(raw),
+    ...parseRemindersFromRaw(text),
+    ...parseRemindersFromTags(task.tags)
+  ]);
   const storedId = getStoredTaskId(raw ?? text);
   const externalId = getTaskExternalId(task);
   const identityPieces = [path ?? "", line ?? "", raw ?? text];
@@ -687,7 +907,7 @@ export const toTaskRecord = (task: TaskLike): TaskRecord => {
   }
   const id = storedId ?? hashTaskId(identityPieces.join("::"));
   const shortId = id.slice(0, 8);
-  return { id, shortId, text, path, line, raw, priority, dueTimestamp };
+  return { id, shortId, text, path, line, raw, priority, dueTimestamp, dueHasTime: dueInfo.dueHasTime, reminders };
 };
 
 export const ensureTaskIdTagOnLine = (lineText: string, id: string): string => {

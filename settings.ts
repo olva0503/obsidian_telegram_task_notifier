@@ -18,6 +18,7 @@ export interface TelegramTasksNotifierSettings {
   allowedTelegramUserIds: number[];
   taskIdTaggingMode: TaskIdTaggingMode;
   lastIntervalNotificationSentAt: number;
+  lastReminderCheckAt: number;
 }
 
 export const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
@@ -29,7 +30,7 @@ export const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
   globalFilterTag: "",
   dailyNotePathTemplate: "",
   notifyOnStartup: true,
-  notificationIntervalMinutes: 60,
+  notificationIntervalMinutes: 1,
   pollIntervalSeconds: 10,
   maxTasksPerNotification: 20,
   includeFilePath: true,
@@ -37,7 +38,8 @@ export const DEFAULT_SETTINGS: TelegramTasksNotifierSettings = {
   lastUpdateId: 0,
   allowedTelegramUserIds: [],
   taskIdTaggingMode: "always",
-  lastIntervalNotificationSentAt: 0
+  lastIntervalNotificationSentAt: 0,
+  lastReminderCheckAt: 0
 };
 
 export const parseAllowedUserIds = (value: string): number[] => {

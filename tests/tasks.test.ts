@@ -5,6 +5,7 @@ import {
   formatTaskTextForMessage,
   getRecurrenceNextTimestamp,
   getRecurringCompletedAt,
+  getTaskDueInfo,
   getTaskDueTimestamp,
   getTaskPriority,
   getTaskText,
@@ -17,7 +18,9 @@ import {
   normalizeTasksQuery,
   parseRecurrenceFromRaw,
   parseDueFromRaw,
+  parseDueInfoFromRaw,
   parsePriorityFromRaw,
+  parseRemindersFromRaw,
   replaceCheckbox,
   stripRecurringCompletedTag,
   taskMatchesGlobalTag,
@@ -25,6 +28,15 @@ import {
   uncheckCheckbox,
   upsertRecurringCompletedTag
 } from "../tasks";
+
+const localTs = (
+  year: number,
+  monthIndex: number,
+  day: number,
+  hour: number = 0,
+  minute: number = 0,
+  second: number = 0
+): number => new Date(year, monthIndex, day, hour, minute, second).getTime();
 
 describe("tasks utilities", () => {
   it("normalizes tasks query from fenced block", () => {
@@ -92,6 +104,22 @@ describe("tasks utilities", () => {
   it("parses due dates from raw text", () => {
     const parsed = parseDueFromRaw("- [ ] task \uD83D\uDCC5 2024-12-31");
     expect(parsed).toBe(Date.UTC(2024, 11, 31));
+    expect(parseDueInfoFromRaw("- [ ] task \uD83D\uDCC5 2026-02-18 14:47")).toEqual({
+      dueTimestamp: localTs(2026, 1, 18, 14, 47, 0),
+      dueHasTime: true
+    });
+    expect(parseDueInfoFromRaw("- [ ] task due:2024-12-31 13:45")).toEqual({
+      dueTimestamp: localTs(2024, 11, 31, 13, 45, 0),
+      dueHasTime: true
+    });
+  });
+
+  it("parses reminder tags from raw text", () => {
+    const reminders = parseRemindersFromRaw("- [ ] task #remind/1d #remind/30m");
+    expect(reminders).toEqual([
+      { value: 1, unit: "d" },
+      { value: 30, unit: "m" }
+    ]);
   });
 
   it("derives task priority and due timestamps", () => {
@@ -99,10 +127,39 @@ describe("tasks utilities", () => {
     expect(getTaskDueTimestamp({ dueDate: "2024-05-06" })) .toBe(Date.UTC(2024, 4, 6));
   });
 
+  it("detects whether due date includes time", () => {
+    expect(getTaskDueInfo({ dueDate: "2024-05-06" })).toEqual({
+      dueTimestamp: Date.UTC(2024, 4, 6),
+      dueHasTime: false
+    });
+    expect(getTaskDueInfo({ dueDate: "2024-05-06T12:30:00" }).dueHasTime).toBe(true);
+    expect(
+      getTaskDueInfo({
+        dueDate: "2024-05-06",
+        dueDateTime: "2024-05-06T12:30:00"
+      })
+    ).toEqual({
+      dueTimestamp: localTs(2024, 4, 6, 12, 30, 0),
+      dueHasTime: true
+    });
+  });
+
   it("builds a task line from input text", () => {
     const parsed = buildTaskLineFromInput("Buy milk due:2024-12-31 priority: high");
     expect(parsed.cleanedText).toBe("Buy milk");
     expect(parsed.lineText).toBe("- [ ] Buy milk \uD83D\uDD3C \uD83D\uDCC5 2024-12-31");
+  });
+
+  it("builds a task line from input text with due datetime", () => {
+    const parsed = buildTaskLineFromInput("Buy milk due:2024-12-31 13:45 priority: high");
+    expect(parsed.cleanedText).toBe("Buy milk");
+    expect(parsed.lineText).toBe("- [ ] Buy milk \uD83D\uDD3C \uD83D\uDCC5 2024-12-31 13:45");
+  });
+
+  it("builds a task line from date alias with due datetime", () => {
+    const parsed = buildTaskLineFromInput("Buy milk date:2024-12-31T13:45");
+    expect(parsed.cleanedText).toBe("Buy milk");
+    expect(parsed.lineText).toBe("- [ ] Buy milk \uD83D\uDCC5 2024-12-31 13:45");
   });
 
   it("matches global tags from task metadata or raw", () => {
@@ -132,6 +189,18 @@ describe("tasks utilities", () => {
     expect(record.path).toBe("Notes.md");
     expect(record.line).toBe(2);
     expect(record.shortId.length).toBe(8);
+  });
+
+  it("parses reminders from tags when raw text has none", () => {
+    const record = toTaskRecord({
+      description: "Write docs",
+      raw: "- [ ] Write docs",
+      tags: ["remind/1d", "#remind/30m", { tag: "remind/1d" }]
+    });
+    expect(record.reminders).toEqual([
+      { value: 1, unit: "d" },
+      { value: 30, unit: "m" }
+    ]);
   });
 
   it("detects completed tasks", () => {

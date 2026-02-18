@@ -12,6 +12,7 @@ Send your unfinished Obsidian Tasks to Telegram and mark them complete right fro
 - Optional global tag filter (e.g. `#work`) to limit what gets sent.
 - Task ID tagging to reliably complete tasks from Telegram.
 - Optional file path and line number in messages.
+- Reminder-based notifications via `#remind/<value><unit>` tags (for example, `#remind/1d`, `#remind/30m`).
 
 ## Requirements
 
@@ -54,7 +55,12 @@ All settings are in `Settings` -> `Telegram Tasks Notifier`:
   - `on-complete`: Add the tag only when a task is marked complete.
   - `never`: Never write tags back to files.
 - `Notify on startup` (default: `true`): Send a notification when Obsidian starts.
-- `Notification interval (minutes)` (default: `60`): Set to `0` to disable periodic notifications.
+- `Notification interval (minutes)` (fixed: `1`): Reminder checks run every minute.
+  - Scheduled notifications are reminder-based and include overdue tasks.
+  - Tasks overdue with due time are reminded every hour until completed, even without `#remind/...`.
+  - Date-only overdue tasks are included when they have at least one `#remind/...` tag.
+  - Tasks without a due date are skipped for reminders.
+  - Date-only due dates support day-based reminders; minute/hour reminders require due date with time.
 - `Poll Telegram updates` (default: `true`): Enable Telegram polling for actions.
 - `Polling interval (seconds)` (default: `10`): Long-poll duration for updates.
 - `Max tasks per notification` (default: `20`): Limit tasks per Telegram message.
@@ -73,8 +79,10 @@ In Telegram:
 - Send `/help` to see supported commands and task formats.
 - Tap `Done #<id>` to mark a task complete.
 - Send `done <id>` to mark a task complete manually.
+- Send `/reminders` to list tasks that should be reminded now, including overdue tasks.
 - Send any message to create a new task in the latest daily note.
   - Optional metadata: `due:YYYY-MM-DD` and `priority: high|medium|low|urgent` (or `p0`-`p4`).
+  - Optional reminder tags: `#remind/1d`, `#remind/30m`, `#remind/1w`, `#remind/1mo`.
   - Guests automatically tag new tasks with `#shared`.
 - Shared task guidance is shown in Telegram help only for the host chat.
 

@@ -107,6 +107,204 @@ describe("TelegramTasksNotifierPlugin", () => {
     expect(keyboard?.[1]?.[0]?.text).toBe("List");
   });
 
+  it("responds to /reminders by sending tasks that should be reminded now", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one #remind/1h 📅 2026-02-18 12:00\n- [ ] Task two 📅 2026-02-18 12:00"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0,
+      lastReminderCheckAt: Date.UTC(2026, 1, 18, 10, 30, 0),
+      lastIntervalNotificationSentAt: 0
+    };
+
+    const originalNow = Date.now;
+    Date.now = () => Date.UTC(2026, 1, 18, 11, 30, 0);
+
+    try {
+      const sent: string[] = [];
+      (plugin as any).telegramClient = {
+        getUpdates: async () => [
+          {
+            update_id: 1,
+            message: {
+              text: "/reminders",
+              chat: { id: 123 },
+              from: { id: 999 }
+            }
+          }
+        ],
+        sendMessageTo: async (_chatId: string | number, text: string) => {
+          sent.push(text);
+        },
+        answerCallbackQuery: async () => {}
+      };
+
+      await (plugin as any).pollTelegramUpdates();
+
+      expect(sent.length).toBe(1);
+      expect(sent[0]).toContain("Unfinished tasks: 1");
+      expect(sent[0]).toContain("Task one");
+      expect(sent[0]).not.toContain("Task two");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("responds to /reminders with empty message when no task should be reminded", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Task one #remind/1d 📅 2026-02-20"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0,
+      lastReminderCheckAt: Date.UTC(2026, 1, 18, 10, 0, 0),
+      lastIntervalNotificationSentAt: 0
+    };
+
+    const originalNow = Date.now;
+    Date.now = () => Date.UTC(2026, 1, 18, 11, 30, 0);
+
+    try {
+      const sent: string[] = [];
+      (plugin as any).telegramClient = {
+        getUpdates: async () => [
+          {
+            update_id: 1,
+            message: {
+              text: "/reminders",
+              chat: { id: 123 },
+              from: { id: 999 }
+            }
+          }
+        ],
+        sendMessageTo: async (_chatId: string | number, text: string) => {
+          sent.push(text);
+        },
+        answerCallbackQuery: async () => {}
+      };
+
+      await (plugin as any).pollTelegramUpdates();
+
+      expect(sent.length).toBe(1);
+      expect(sent[0]).toBe("No tasks should be reminded right now.");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("responds to /reminders with overdue tasks", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Overdue task #remind/1h 📅 2026-02-18 12:00"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0,
+      lastReminderCheckAt: Date.UTC(2026, 1, 18, 11, 30, 0),
+      lastIntervalNotificationSentAt: 0
+    };
+
+    const originalNow = Date.now;
+    Date.now = () => Date.UTC(2026, 1, 18, 12, 30, 0);
+
+    try {
+      const sent: string[] = [];
+      (plugin as any).telegramClient = {
+        getUpdates: async () => [
+          {
+            update_id: 1,
+            message: {
+              text: "/reminders",
+              chat: { id: 123 },
+              from: { id: 999 }
+            }
+          }
+        ],
+        sendMessageTo: async (_chatId: string | number, text: string) => {
+          sent.push(text);
+        },
+        answerCallbackQuery: async () => {}
+      };
+
+      await (plugin as any).pollTelegramUpdates();
+
+      expect(sent.length).toBe(1);
+      expect(sent[0]).toContain("Unfinished tasks: 1");
+      expect(sent[0]).toContain("Overdue task");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("filters /reminders for guests to shared tasks", async () => {
+    const app = createApp({
+      "Notes.md": "- [ ] Shared task #shared #remind/1h 📅 2026-02-18 12:00\n- [ ] Private task #remind/1h 📅 2026-02-18 12:00"
+    });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      guestChatIds: [456],
+      enableTelegramPolling: true,
+      pollIntervalSeconds: 10,
+      taskIdTaggingMode: "never",
+      lastUpdateId: 0,
+      lastReminderCheckAt: Date.UTC(2026, 1, 18, 10, 30, 0),
+      lastIntervalNotificationSentAt: 0
+    };
+
+    const originalNow = Date.now;
+    Date.now = () => Date.UTC(2026, 1, 18, 11, 30, 0);
+
+    try {
+      const sent: string[] = [];
+      (plugin as any).telegramClient = {
+        getUpdates: async () => [
+          {
+            update_id: 1,
+            message: {
+              text: "/reminders",
+              chat: { id: 456 },
+              from: { id: 999 }
+            }
+          }
+        ],
+        sendMessageTo: async (_chatId: string | number, text: string) => {
+          sent.push(text);
+        },
+        answerCallbackQuery: async () => {}
+      };
+
+      await (plugin as any).pollTelegramUpdates();
+
+      expect(sent.length).toBe(1);
+      expect(sent[0]).toContain("Unfinished tasks: 1");
+      expect(sent[0]).toContain("Shared task");
+      expect(sent[0]).not.toContain("Private task");
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   it("responds to /help with shared tasks guidance for host", async () => {
     const app = createApp({
       "Notes.md": "- [ ] Task one"
@@ -354,6 +552,26 @@ describe("TelegramTasksNotifierPlugin", () => {
     const stored = app.__store.get("2024-01-01.md");
     expect(stored?.contents).toBe(`${lineText} ${TASK_ID_TAG_PREFIX}${id}`);
     expect(sent[0]).toBe(`Added task: Buy milk #${shortId}`);
+  });
+
+  it("adds telegram tasks with due datetime without leaking time into text", async () => {
+    const app = createApp({ "2024-01-01.md": "" });
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      botToken: "token",
+      hostChatId: "123",
+      taskIdTaggingMode: "never"
+    };
+
+    (plugin as any).telegramClient = {
+      sendMessageTo: async () => {}
+    };
+
+    await (plugin as any).addTaskFromTelegram("Buy milk due:2024-12-31 13:45", { role: "host", chatId: 123 });
+
+    const stored = app.__store.get("2024-01-01.md");
+    expect(stored?.contents).toBe("- [ ] Buy milk 📅 2024-12-31 13:45");
   });
 
   it("falls back to creating a note when daily notes index fails", async () => {
@@ -721,7 +939,7 @@ describe("TelegramTasksNotifierPlugin", () => {
 
   it("skips interval notification when interval has not elapsed", async () => {
     const app = createApp({
-      "Notes.md": "- [ ] Task one"
+      "Notes.md": "- [ ] Task one #remind/1d 📅 2024-01-01"
     });
     const plugin = new (TelegramTasksNotifierPlugin as any)(app);
     plugin.settings = {
@@ -733,21 +951,34 @@ describe("TelegramTasksNotifierPlugin", () => {
       lastIntervalNotificationSentAt: Date.now()
     };
 
-    const sent: string[] = [];
-    (plugin as any).telegramClient = {
-      sendMessageTo: async (_chatId: string | number, text: string) => {
-        sent.push(text);
-      }
+    let called = false;
+    (plugin as any).sendReminderNotifications = async () => {
+      called = true;
+      return "sent";
     };
 
     await (plugin as any).sendIntervalNotificationIfDue();
 
-    expect(sent).toEqual([]);
+    expect(called).toBe(false);
+  });
+
+  it("treats exactly elapsed interval as due", () => {
+    const app = createApp({});
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      notificationIntervalMinutes: 1,
+      lastReminderCheckAt: 1000,
+      lastIntervalNotificationSentAt: 0
+    };
+
+    const due = (plugin as any).isIntervalNotificationDue(61_000);
+    expect(due).toBe(true);
   });
 
   it("sends interval notification once elapsed and stores timestamp", async () => {
     const app = createApp({
-      "Notes.md": "- [ ] Task one"
+      "Notes.md": "- [ ] Task one #remind/1d 📅 2024-01-01"
     });
     const plugin = new (TelegramTasksNotifierPlugin as any)(app);
     const before = Date.now() - 61 * 60 * 1000;
@@ -760,22 +991,21 @@ describe("TelegramTasksNotifierPlugin", () => {
       lastIntervalNotificationSentAt: before
     };
 
-    const sent: string[] = [];
-    (plugin as any).telegramClient = {
-      sendMessageTo: async (_chatId: string | number, text: string) => {
-        sent.push(text);
-      }
+    let called = false;
+    (plugin as any).sendReminderNotifications = async () => {
+      called = true;
+      return "sent";
     };
 
     await (plugin as any).sendIntervalNotificationIfDue();
 
-    expect(sent.length).toBe(1);
+    expect(called).toBe(true);
     expect(plugin.settings.lastIntervalNotificationSentAt).toBeGreaterThan(before);
   });
 
   it("does not store interval timestamp when send fails", async () => {
     const app = createApp({
-      "Notes.md": "- [ ] Task one"
+      "Notes.md": "- [ ] Task one #remind/1d 📅 2024-01-01"
     });
     const plugin = new (TelegramTasksNotifierPlugin as any)(app);
     const before = Date.now() - 61 * 60 * 1000;
@@ -788,15 +1018,156 @@ describe("TelegramTasksNotifierPlugin", () => {
       lastIntervalNotificationSentAt: before
     };
 
-    (plugin as any).telegramClient = {
-      sendMessageTo: async () => {
-        throw new Error("network down");
-      }
+    (plugin as any).sendReminderNotifications = async () => {
+      return "failed";
     };
 
     await (plugin as any).sendIntervalNotificationIfDue();
 
     expect(plugin.settings.lastIntervalNotificationSentAt).toBe(before);
+  });
+
+  it("does not remind tasks without reminder tags", () => {
+    const app = createApp({});
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS
+    };
+
+    const shouldSend = (plugin as any).shouldSendReminderForTask(
+      {
+        id: "id",
+        shortId: "id",
+        text: "Task",
+        path: "Notes.md",
+        line: 0,
+        raw: "- [ ] Task 📅 2024-01-01",
+        priority: 0,
+        dueTimestamp: Date.UTC(2024, 0, 1),
+        dueHasTime: false,
+        reminders: []
+      },
+      Date.UTC(2023, 11, 31),
+      Date.UTC(2024, 0, 1)
+    );
+
+    expect(shouldSend).toBe(false);
+  });
+
+  it("ignores minute reminders for date-only due dates", () => {
+    const app = createApp({});
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS
+    };
+
+    const due = Date.UTC(2024, 0, 1);
+    const shouldSend = (plugin as any).shouldSendReminderForTask(
+      {
+        id: "id",
+        shortId: "id",
+        text: "Task",
+        path: "Notes.md",
+        line: 0,
+        raw: "- [ ] Task #remind/30m 📅 2024-01-01",
+        priority: 0,
+        dueTimestamp: due,
+        dueHasTime: false,
+        reminders: [{ value: 30, unit: "m" }]
+      },
+      due - 31 * 60 * 1000,
+      due - 29 * 60 * 1000
+    );
+
+    expect(shouldSend).toBe(false);
+  });
+
+  it("sends hourly reminders for overdue tasks with due time", () => {
+    const app = createApp({});
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS
+    };
+
+    const due = Date.UTC(2024, 0, 1, 10, 0, 0);
+    const shouldSend = (plugin as any).shouldSendReminderForTask(
+      {
+        id: "id",
+        shortId: "id",
+        text: "Task",
+        path: "Notes.md",
+        line: 0,
+        raw: "- [ ] Task",
+        priority: 0,
+        dueTimestamp: due,
+        dueHasTime: true,
+        reminders: [{ value: 30, unit: "m" }]
+      },
+      due + 10 * 60 * 1000,
+      due + 70 * 60 * 1000
+    );
+
+    expect(shouldSend).toBe(true);
+  });
+
+  it("sends hourly overdue reminders even without reminder tags", () => {
+    const app = createApp({});
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS
+    };
+
+    const due = Date.UTC(2024, 0, 1, 10, 0, 0);
+    const shouldSend = (plugin as any).shouldSendReminderForTask(
+      {
+        id: "id",
+        shortId: "id",
+        text: "Task",
+        path: "Notes.md",
+        line: 0,
+        raw: "- [ ] Task",
+        priority: 0,
+        dueTimestamp: due,
+        dueHasTime: true,
+        reminders: []
+      },
+      due + 10 * 60 * 1000,
+      due + 70 * 60 * 1000
+    );
+
+    expect(shouldSend).toBe(true);
+  });
+
+  it("includes overdue tasks in interval reminder collection", async () => {
+    const app = createApp({});
+    const plugin = new (TelegramTasksNotifierPlugin as any)(app);
+    plugin.settings = {
+      ...DEFAULT_SETTINGS
+    };
+
+    const due = Date.UTC(2024, 0, 1, 10, 0, 0);
+    (plugin as any).collectTasks = async () => [
+      {
+        id: "id",
+        shortId: "id",
+        text: "Task",
+        path: "Notes.md",
+        line: 0,
+        raw: "- [ ] Task #remind/1h 📅 2024-01-01 10:00",
+        priority: 0,
+        dueTimestamp: due,
+        dueHasTime: true,
+        reminders: [{ value: 1, unit: "h" }]
+      }
+    ];
+
+    const tasks = await (plugin as any).collectReminderTasks(
+      due + 30 * 60 * 1000,
+      due + 40 * 60 * 1000
+    );
+
+    expect(tasks.length).toBe(1);
+    expect(tasks[0]?.text).toBe("Task");
   });
 
   it("configures recurring sweep interval even when notifications are disabled", () => {

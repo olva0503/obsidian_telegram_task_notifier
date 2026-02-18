@@ -24,7 +24,8 @@ import {
   normalizeTasksQuery,
   normalizeTagFilter,
   parseRecurrenceFromRaw,
-  parseDueFromRaw,
+  parseDueInfoFromRaw,
+  parseRemindersFromRaw,
   parsePriorityFromRaw,
   replaceCheckbox,
   stripRecurringCompletedTag,
@@ -157,38 +158,199 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     this.stopPollingLoop();
   }
 
+  private notify(message: string): void {
+    new Notice(message);
+  }
+
   private isIntervalNotificationDue(now: number = Date.now()): boolean {
     const intervalMinutes = this.settings.notificationIntervalMinutes;
     if (intervalMinutes <= 0) {
       return false;
     }
     const intervalMs = intervalMinutes * 60 * 1000;
-    const lastSentAt = this.settings.lastIntervalNotificationSentAt;
-    return now - lastSentAt > intervalMs;
+    const lastCheckedAt = Math.max(
+      this.settings.lastReminderCheckAt ?? 0,
+      this.settings.lastIntervalNotificationSentAt ?? 0
+    );
+    return now - lastCheckedAt >= intervalMs;
   }
 
   private async sendIntervalNotificationIfDue(): Promise<void> {
+    const now = Date.now();
     if (!this.isIntervalNotificationDue()) {
       return;
     }
-    const sent = await this.sendTasksNotification();
-    if (!sent) {
+    const lastCheckedAt = Math.max(
+      this.settings.lastReminderCheckAt ?? 0,
+      this.settings.lastIntervalNotificationSentAt ?? 0
+    );
+    const result = await this.sendReminderNotifications(lastCheckedAt, now);
+    if (result === "failed") {
       return;
     }
-    this.settings.lastIntervalNotificationSentAt = Date.now();
+    this.settings.lastReminderCheckAt = now;
+    if (result === "sent") {
+      this.settings.lastIntervalNotificationSentAt = now;
+    }
     await this.saveSettings();
   }
 
   private async sendIntervalNotificationWithRetryIfDue(): Promise<void> {
+    const now = Date.now();
     if (!this.isIntervalNotificationDue()) {
       return;
     }
-    const sent = await this.sendTasksNotificationWithRetry();
-    if (!sent) {
+    const lastCheckedAt = Math.max(
+      this.settings.lastReminderCheckAt ?? 0,
+      this.settings.lastIntervalNotificationSentAt ?? 0
+    );
+    const result = await this.sendReminderNotifications(lastCheckedAt, now, { retry: true });
+    if (result === "failed") {
       return;
     }
-    this.settings.lastIntervalNotificationSentAt = Date.now();
+    this.settings.lastReminderCheckAt = now;
+    if (result === "sent") {
+      this.settings.lastIntervalNotificationSentAt = now;
+    }
     await this.saveSettings();
+  }
+
+  private async sendReminderNotifications(
+    lastCheckedAt: number,
+    now: number,
+    options: { retry?: boolean } = {}
+  ): Promise<"sent" | "noop" | "failed"> {
+    const tasks = options.retry
+      ? await this.collectReminderTasksWithRetry(lastCheckedAt, now)
+      : await this.collectReminderTasks(lastCheckedAt, now);
+    if (tasks.length === 0) {
+      return "noop";
+    }
+    const sent = await this.sendTasksNotificationWithTasks(tasks);
+    return sent ? "sent" : "failed";
+  }
+
+  private async collectReminderTasks(lastCheckedAt: number, now: number): Promise<TaskRecord[]> {
+    const tasks = await this.collectTasks();
+    return tasks.filter((task) =>
+      this.shouldSendReminderForTask(task, lastCheckedAt, now) ||
+      this.shouldListOverdueTaskInReminders(task, now)
+    );
+  }
+
+  private async collectTasksThatShouldBeReminded(now: number = Date.now()): Promise<TaskRecord[]> {
+    const lastCheckedAt = Math.max(
+      this.settings.lastReminderCheckAt ?? 0,
+      this.settings.lastIntervalNotificationSentAt ?? 0
+    );
+    return this.collectReminderTasks(lastCheckedAt, now);
+  }
+
+  private shouldListOverdueTaskInReminders(task: TaskRecord, now: number): boolean {
+    if (task.dueTimestamp === null || task.dueTimestamp > now) {
+      return false;
+    }
+    if (task.dueHasTime) {
+      return true;
+    }
+    const reminders = task.reminders ?? [];
+    return reminders.length > 0;
+  }
+
+  private async collectReminderTasksWithRetry(lastCheckedAt: number, now: number): Promise<TaskRecord[]> {
+    const attempts = 4;
+    const delayMs = 1500;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const tasks = await this.collectReminderTasks(lastCheckedAt, now);
+      if (tasks.length > 0 || attempt === attempts - 1) {
+        return tasks;
+      }
+      await this.sleep(delayMs);
+    }
+    return [];
+  }
+
+  private shouldSendReminderForTask(task: TaskRecord, lastCheckedAt: number, now: number): boolean {
+    if (task.dueTimestamp === null) {
+      return false;
+    }
+    const reminders = task.reminders ?? [];
+
+    for (const reminder of reminders) {
+      if (!task.dueHasTime && (reminder.unit === "m" || reminder.unit === "h")) {
+        continue;
+      }
+      const triggerAt = this.getReminderTriggerTimestamp(task.dueTimestamp, reminder.value, reminder.unit);
+      if (this.wasTimestampCrossed(lastCheckedAt, now, triggerAt)) {
+        return true;
+      }
+    }
+
+    return this.shouldSendHourlyOverdueReminder(task, lastCheckedAt, now);
+  }
+
+  private wasTimestampCrossed(lastCheckedAt: number, now: number, timestamp: number): boolean {
+    if (timestamp > now) {
+      return false;
+    }
+    if (lastCheckedAt <= 0) {
+      return true;
+    }
+    return lastCheckedAt < timestamp;
+  }
+
+  private shouldSendHourlyOverdueReminder(task: TaskRecord, lastCheckedAt: number, now: number): boolean {
+    if (!task.dueHasTime || task.dueTimestamp === null) {
+      return false;
+    }
+    if (now <= task.dueTimestamp) {
+      return false;
+    }
+    const hourMs = 60 * 60 * 1000;
+    const currentBucket = Math.floor((now - task.dueTimestamp) / hourMs);
+    if (currentBucket < 0) {
+      return false;
+    }
+    const previousBucket = lastCheckedAt <= task.dueTimestamp
+      ? -1
+      : Math.floor((lastCheckedAt - task.dueTimestamp) / hourMs);
+    return currentBucket > previousBucket;
+  }
+
+  private getReminderTriggerTimestamp(dueTimestamp: number, value: number, unit: "m" | "h" | "d" | "w" | "mo"): number {
+    if (unit === "mo") {
+      return this.subtractCalendarMonths(dueTimestamp, value);
+    }
+    const multipliers: Record<Exclude<typeof unit, "mo">, number> = {
+      m: 60 * 1000,
+      h: 60 * 60 * 1000,
+      d: 24 * 60 * 60 * 1000,
+      w: 7 * 24 * 60 * 60 * 1000
+    };
+    return dueTimestamp - value * multipliers[unit];
+  }
+
+  private subtractCalendarMonths(timestamp: number, months: number): number {
+    const source = new Date(timestamp);
+    if (!Number.isFinite(source.getTime())) {
+      return timestamp;
+    }
+    const targetMonthIndex = source.getMonth() - months;
+    const yearDelta = Math.floor(targetMonthIndex / 12);
+    const targetYear = source.getFullYear() + yearDelta;
+    const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
+    const maxDayInMonth = new Date(targetYear, targetMonth + 1, 0).getDate();
+    const day = Math.min(source.getDate(), maxDayInMonth);
+    const target = new Date(
+      targetYear,
+      targetMonth,
+      day,
+      source.getHours(),
+      source.getMinutes(),
+      source.getSeconds(),
+      source.getMilliseconds()
+    );
+    return target.getTime();
   }
 
   private startPollingLoop(): void {
@@ -214,7 +376,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         this.pollingErrorStreak += 1;
         const backoff = this.getPollingBackoffMs(this.pollingErrorStreak);
         console.warn("Telegram polling failed", error);
-        new Notice("Telegram polling failed. Retrying soon.");
+        this.notify("Telegram polling failed. Retrying soon.");
         await this.sleep(backoff);
       }
     }
@@ -230,6 +392,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings.notificationIntervalMinutes = 1;
   }
 
   async saveSettings(): Promise<void> {
@@ -357,7 +520,8 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         const id = storedId ?? hashTaskId(`${file.path}::${i}::${lineText}`);
         const shortId = id.slice(0, 8);
         const priority = parsePriorityFromRaw(lineText) ?? 0;
-        const dueTimestamp = parseDueFromRaw(lineText);
+        const dueInfo = parseDueInfoFromRaw(lineText);
+        const reminders = parseRemindersFromRaw(lineText);
 
         if (shouldTag && !storedId) {
           lines[i] = ensureTaskIdTagOnLine(lineText, id);
@@ -372,7 +536,9 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           line: i,
           raw: lineText,
           priority,
-          dueTimestamp
+          dueTimestamp: dueInfo.dueTimestamp,
+          dueHasTime: dueInfo.dueHasTime,
+          reminders
         });
       }
 
@@ -567,7 +733,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     options: { allowEmpty?: boolean; emptyMessage?: string } = {}
   ): Promise<boolean> {
     if (!this.settings.botToken.trim()) {
-      new Notice("Telegram bot token is missing.");
+      this.notify("Telegram bot token is missing.");
       return false;
     }
 
@@ -588,7 +754,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
 
     if (targets.length === 0) {
-      new Notice("Telegram host or guest chat IDs are missing.");
+      this.notify("Telegram host or guest chat IDs are missing.");
       return false;
     }
 
@@ -609,7 +775,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           }
         }
       } else {
-        new Notice("No unfinished tasks found.");
+        this.notify("No unfinished tasks found.");
       }
       return sentAny;
     }
@@ -638,7 +804,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         );
         return sent !== null;
       } else if (role === "host") {
-        new Notice("No unfinished tasks found.");
+        this.notify("No unfinished tasks found.");
       }
       return false;
     }
@@ -746,7 +912,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       return await action();
     } catch (error) {
       console.warn(`Telegram ${label} failed`, error);
-      new Notice(`Telegram ${label} failed. Check your connection or bot settings.`);
+      this.notify(`Telegram ${label} failed. Check your connection or bot settings.`);
       return null;
     }
   }
@@ -820,6 +986,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       "",
       "Commands:",
       "- /list - send the current task list",
+      "- /reminders - list tasks that should be reminded now",
       "- done <id> - mark a task as complete",
       "- /help - show this help",
       "",
@@ -831,6 +998,8 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       "- With date alias: Buy milk date:2026-02-14",
       "- With priority: Prepare slides priority: high",
       "- With short priority: Prepare slides p3",
+      "- With reminder: Buy milk #remind/1d",
+      "- Multiple reminders: Buy milk #remind/1d #remind/30m",
       "- Recurring: Water plants #recur/1d",
       "",
       "You can combine options in one task message."
@@ -962,7 +1131,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           }
           const success = await this.markTaskComplete(task);
           if (success) {
-            new Notice(`Task marked complete: ${task.text}`);
+              this.notify(`Task marked complete: ${task.text}`);
           }
           if (success && callbackChatId !== undefined && callbackChatId !== null) {
             const tasks = await this.collectTasks();
@@ -1010,6 +1179,21 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           continue;
         }
 
+        const remindersMatch = messageText.match(/^\s*\/reminders(?:@\S+)?\s*$/i);
+        if (remindersMatch) {
+          if (!this.isAllowedTelegramUser(userId)) {
+            continue;
+          }
+          const tasks = await this.collectTasksThatShouldBeReminded();
+          if (chatId !== undefined && chatId !== null) {
+            await this.sendTasksNotificationToChat(tasks, chatId, role, {
+              allowEmpty: true,
+              emptyMessage: "No tasks should be reminded right now."
+            });
+          }
+          continue;
+        }
+
         const helpMatch = messageText.match(/^\s*\/help(?:@\S+)?\s*$/i);
         if (helpMatch) {
           if (!this.isAllowedTelegramUser(userId)) {
@@ -1044,7 +1228,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           }
           const success = await this.markTaskComplete(task);
           if (success) {
-            new Notice(`Task marked complete: ${task.text}`);
+            this.notify(`Task marked complete: ${task.text}`);
           }
           if (success && chatId !== undefined && chatId !== null) {
             const tasks = await this.collectTasks();
@@ -1081,13 +1265,13 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
   async detectTelegramChatId(): Promise<void> {
     if (!this.settings.botToken.trim()) {
-      new Notice("Telegram bot token is missing.");
+      this.notify("Telegram bot token is missing.");
       return;
     }
 
     const updates = await this.telegramClient.getUpdates(0, 0);
     if (updates.length === 0) {
-      new Notice("No Telegram updates found. Send /start to the bot first.");
+      this.notify("No Telegram updates found. Send /start to the bot first.");
       return;
     }
 
@@ -1114,12 +1298,12 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
 
     const resolvedChatId = startChatId ?? detectedChatId;
     if (resolvedChatId === null) {
-      new Notice("No chat ID found in updates.");
+      this.notify("No chat ID found in updates.");
       return;
     }
 
     if (!startChatId) {
-      new Notice("No /start message found. Using latest chat ID from updates.");
+      this.notify("No /start message found. Using latest chat ID from updates.");
     }
 
     if (!this.settings.requestors.includes(resolvedChatId)) {
@@ -1127,7 +1311,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
     this.settings.lastUpdateId = latestUpdateId;
     await this.saveSettings();
-    new Notice(`Recorded requestor chat ID ${resolvedChatId}`);
+    this.notify(`Recorded requestor chat ID ${resolvedChatId}`);
   }
 
   private async resolveLatestDailyNoteFile(): Promise<TFile | null> {
@@ -1140,7 +1324,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       if (ensured) {
         return ensured;
       }
-      new Notice("Daily note path override could not be created.");
+      this.notify("Daily note path override could not be created.");
       return null;
     }
     let allNotes: Record<string, TFile> | Map<string, TFile> | null = null;
@@ -1148,7 +1332,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       allNotes = dailyNotesApi.getAllDailyNotes?.() ?? null;
     } catch (error) {
       console.warn("Failed to read daily notes index", error);
-      new Notice("Failed to read daily notes index. Creating today's note.");
+      this.notify("Failed to read daily notes index. Creating today's note.");
     }
     const files = this.extractDailyNoteFiles(allNotes)
       .map((file) => this.normalizeDailyNoteFile(file))
@@ -1164,23 +1348,23 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
         if (normalized) {
           return normalized;
         }
-        new Notice("Daily note file could not be resolved. Using fallback daily note path.");
+        this.notify("Daily note file could not be resolved. Using fallback daily note path.");
       } catch (error) {
         console.warn("Failed to create daily note", error);
-        new Notice("Failed to create daily note.");
+        this.notify("Failed to create daily note.");
       }
     }
 
     if (!rawSettings) {
-      new Notice("Daily Notes plugin is not configured. Using fallback daily note path.");
+      this.notify("Daily Notes plugin is not configured. Using fallback daily note path.");
     } else if (!dailyNotesApi.createDailyNote) {
-      new Notice("Daily Notes plugin is not available. Using fallback daily note path.");
+      this.notify("Daily Notes plugin is not available. Using fallback daily note path.");
     }
 
     const fallbackPath = this.buildDailyNotePath(settings, this.formatDailyNoteDate(settings));
     const ensured = await this.ensureDailyNoteFile(fallbackPath);
     if (!ensured) {
-      new Notice("Daily note file could not be created.");
+      this.notify("Daily note file could not be created.");
       return null;
     }
     return ensured;
@@ -1323,12 +1507,12 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
   ): Promise<{ added: boolean; isShared: boolean }> {
     try {
       if (typeof messageText !== "string") {
-        new Notice("Telegram message is invalid; cannot add task.");
+        this.notify("Telegram message is invalid; cannot add task.");
         return { added: false, isShared: false };
       }
       const trimmedMessage = messageText.trim();
       if (!trimmedMessage) {
-        new Notice("Telegram message is empty; cannot add task.");
+        this.notify("Telegram message is empty; cannot add task.");
         return { added: false, isShared: false };
       }
 
@@ -1359,7 +1543,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       const dailyNote = await this.resolveLatestDailyNoteFile();
       if (!dailyNote || !dailyNote.path) {
         const message = "Daily note file not found; cannot add task.";
-        new Notice(message);
+        this.notify(message);
         await this.safeTelegramCall("send message", () =>
           this.telegramClient.sendMessageTo(options.chatId, message)
         );
@@ -1401,7 +1585,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
       const reason = error instanceof Error && error.message ? `: ${error.message}` : ".";
       const location = this.describeErrorLocation(error);
       const locationSuffix = location ? ` (${location})` : "";
-      new Notice(`Failed to add task from Telegram${reason}${locationSuffix}`);
+      this.notify(`Failed to add task from Telegram${reason}${locationSuffix}`);
 
       const stack = error instanceof Error && error.stack ? error.stack : "";
       const header = `Failed to add task from Telegram${reason}`;
@@ -1444,7 +1628,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     const cached = this.taskCache.get(taskId);
     const task = cached ?? (await this.findTaskById(taskId));
     if (!task) {
-      new Notice(`Task not found for ID ${taskId}`);
+      this.notify(`Task not found for ID ${taskId}`);
       return false;
     }
     if (role === "guest" && !this.isSharedTask(task)) {
@@ -1452,7 +1636,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
     const updated = await this.markTaskComplete(task);
     if (updated) {
-      new Notice(`Task marked complete: ${task.text}`);
+      this.notify(`Task marked complete: ${task.text}`);
     }
     return updated;
   }
@@ -1688,14 +1872,14 @@ class TelegramTasksNotifierSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Notification interval (minutes)")
-      .setDesc("Set to 0 to disable periodic notifications.")
+      .setDesc("Reminder checks run every minute (fixed).")
       .addText((text) =>
         text
-          .setPlaceholder("60")
+          .setPlaceholder("1")
           .setValue(String(this.plugin.settings.notificationIntervalMinutes))
-          .onChange(async (value) => {
-            const parsed = Number.parseInt(value, 10);
-            this.plugin.settings.notificationIntervalMinutes = Number.isFinite(parsed) ? parsed : 0;
+          .onChange(async () => {
+            this.plugin.settings.notificationIntervalMinutes = 1;
+            text.setValue("1");
             await this.plugin.saveSettingsAndReconfigure();
           })
       );
