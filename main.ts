@@ -45,7 +45,7 @@ import {
   type TaskIdTaggingMode,
   type TelegramTasksNotifierSettings
 } from "./settings";
-import { TelegramClient, type TelegramUpdate } from "./telegram";
+import { TelegramClient } from "./telegram";
 import { buildTaskIdTagRegexForId, getStoredTaskId, hashTaskId } from "./task-id";
 import * as dailyNotesInterface from "obsidian-daily-notes-interface";
 
@@ -714,20 +714,6 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
     }
   }
 
-  private async sendTasksNotificationWithRetry(): Promise<boolean> {
-    const attempts = 4;
-    const delayMs = 1500;
-
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const tasks = await this.collectTasks();
-      if (tasks.length > 0 || attempt === attempts - 1) {
-        return await this.sendTasksNotificationWithTasks(tasks);
-      }
-      await this.sleep(delayMs);
-    }
-    return false;
-  }
-
   private async sendTasksNotificationWithTasks(
     tasks: TaskRecord[],
     options: { allowEmpty?: boolean; emptyMessage?: string } = {}
@@ -1129,10 +1115,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
             );
             continue;
           }
-          const success = await this.markTaskComplete(task);
-          if (success) {
-              this.notify(`Task marked complete: ${task.text}`);
-          }
+          const success = await this.completeTaskById(task.id, role);
           if (success && callbackChatId !== undefined && callbackChatId !== null) {
             const tasks = await this.collectTasks();
             await this.sendTasksNotificationToChat(tasks, callbackChatId, role, {
@@ -1226,10 +1209,7 @@ export default class TelegramTasksNotifierPlugin extends Plugin {
           if (role === "guest" && !this.isSharedTask(task)) {
             continue;
           }
-          const success = await this.markTaskComplete(task);
-          if (success) {
-            this.notify(`Task marked complete: ${task.text}`);
-          }
+          const success = await this.completeTaskById(task.id, role);
           if (success && chatId !== undefined && chatId !== null) {
             const tasks = await this.collectTasks();
             await this.sendTasksNotificationToChat(tasks, chatId, role, {
